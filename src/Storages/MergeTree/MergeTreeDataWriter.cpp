@@ -1042,7 +1042,7 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeProjectionPartImpl(
     bool is_temp,
     IMergeTreeDataPart * parent_part,
     const MergeTreeData & data,
-    LoggerPtr log,
+    LoggerPtr /* log */,
     Block block,
     const ProjectionDescription & projection,
     MergeTreeIndices indices,
@@ -1057,9 +1057,6 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeProjectionPartImpl(
     // just check if there is enough space on parent volume
     MergeTreeData::reserveSpace(expected_size, parent_part->getDataPartStorage());
     part_type = data.choosePartFormat(expected_size, block.rows(), parent_part->info.level, &projection).part_type;
-
-    /// Register the new projection dir in the parent's owned set (sweeping any stale leftover).
-    parent_part->getDataPartStorage().createProjection(part_name + (is_temp ? ".tmp_proj" : ".proj"));
 
     auto new_data_part = parent_part->getProjectionPartBuilder(part_name, &projection, is_temp).withPartType(part_type).build();
     auto projection_part_storage = new_data_part->getDataPartStoragePtr();
@@ -1087,14 +1084,9 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeProjectionPartImpl(
 
     new_data_part->setColumns(columns, infos, metadata_snapshot->getMetadataVersion());
 
-    /// The name could be non-unique in case of stale files from previous runs.
-    if (projection_part_storage->exists())
-    {
-        LOG_WARNING(log, "Removing old temporary directory {}", projection_part_storage->getFullPath());
-        projection_part_storage->removeRecursive();
-    }
-
-    projection_part_storage->createDirectories();
+    /// Creates the dir (sweeping any stale leftover from previous runs, which is possible because
+    /// the name is not unique) and registers it in the parent's owned set.
+    parent_part->getDataPartStorage().createProjection(part_name + (is_temp ? ".tmp_proj" : ".proj"));
 
     /// If we need to calculate some columns to sort.
     if (metadata_snapshot->hasSortingKey() || metadata_snapshot->hasSecondaryIndices())
