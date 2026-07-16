@@ -1057,7 +1057,7 @@ BlockIO InterpreterInsertQuery::execute()
     }
 
     BlockIO res;
-    if (query.select)
+    if (query.select && !query.async_insert_flush)
     {
         if (settings[Setting::parallel_distributed_insert_select])
         {
