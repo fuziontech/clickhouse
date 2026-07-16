@@ -103,7 +103,13 @@ MutableDataPartStoragePtr MergeTreeDataPartBuilder::getPartStorageByType(
     switch (storage_type_.getValue())
     {
         case Type::Full:
-            return std::make_shared<DataPartStorageOnDiskFull>(volume_, root_path_, part_dir_);
+        {
+            auto storage = std::make_shared<DataPartStorageOnDiskFull>(volume_, root_path_, part_dir_);
+            /// Seed empty: a fresh part registers projections via createProjection, a loaded part
+            /// re-seeds in loadProjections; a disk scan here could adopt residue of a same-named part.
+            storage->setProjections({});
+            return storage;
+        }
         default:
             throw Exception(ErrorCodes::UNKNOWN_PART_TYPE,
                 "Unknown type of storage for part {}", fs::path(root_path_) / part_dir_);

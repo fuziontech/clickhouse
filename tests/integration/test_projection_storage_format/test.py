@@ -853,3 +853,201 @@ def test_detached_surface_flat_sibling():
         user="root",
     ).strip()
     assert leftovers == "0"
+
+
+# MATERIALIZE PROJECTION inside a mutation must finalize the winner tmp_proj into a flat
+# sibling, leave no tmp residue, and survive the part's final rename.
+def test_materialize_projection_mutation_flat():
+    node.query("DROP TABLE IF EXISTS t_mat SYNC")
+    node.query("SYSTEM STOP MERGES")
+    node.query(
+        """CREATE TABLE t_mat (key UInt64, id UInt64, value String)
+           ENGINE = MergeTree ORDER BY key
+           SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat'"""
+    )
+    node.query(
+        "INSERT INTO t_mat SELECT number, number * 2, toString(number) FROM numbers(1000)"
+    )
+    node.query("ALTER TABLE t_mat ADD PROJECTION p (SELECT key, id, value ORDER BY id)")
+    node.query(
+        "ALTER TABLE t_mat MATERIALIZE PROJECTION p SETTINGS mutations_sync = 2"
+    )
+    p = part_dir("t_mat")
+    assert path_exists(f"{p}.p.proj")
+    assert not path_exists(f"{p}/p.proj")
+    tmp_residue = node.exec_in_container(
+        [
+            "bash",
+            "-c",
+            "find /var/lib/clickhouse/data/default/t_mat -maxdepth 1 -name '*.tmp_proj' | wc -l",
+        ],
+        privileged=True,
+        user="root",
+    ).strip()
+    assert tmp_residue == "0"
+    assert check_table("t_mat") == "1"
+    baseline = proj_query("t_mat")
+    node.restart_clickhouse()
+    assert proj_query("t_mat") == baseline
+    assert int(active_projection_parts("t_mat")) >= 1
+
+
+# UNFREEZE must remove flat projection siblings from shadow/ together with their owner.
+def test_unfreeze_removes_flat_siblings():
+    setup_table("t_unfreeze", "projection_storage_format = 'flat'")
+    node.query("ALTER TABLE t_unfreeze FREEZE WITH NAME 'unfr'")
+    found = node.exec_in_container(
+        ["bash", "-c", "find /var/lib/clickhouse/shadow/unfr -name '*p.proj' | wc -l"],
+        privileged=True,
+        user="root",
+    ).strip()
+    assert int(found) >= 1
+    node.query("ALTER TABLE t_unfreeze UNFREEZE WITH NAME 'unfr'")
+    # ALTER UNFREEZE leaves the empty dir skeleton; assert no part dirs and no projection siblings remain
+    leftovers = node.exec_in_container(
+        [
+            "bash",
+            "-c",
+            "find /var/lib/clickhouse/shadow/unfr \\( -name '*_*' -o -name '*.proj' -o -name '*.tmp_proj' \\) 2>/dev/null | wc -l",
+        ],
+        privileged=True,
+        user="root",
+    ).strip()
+    assert leftovers == "0"
+    # the table itself is intact
+    assert check_table("t_unfreeze") == "1"
+
+
+# The periodic cleaner reaps aged orphan siblings (live root and moving/) but never a
+# young one, which may belong to an in-flight rename (commit-last window).
+def test_orphan_sibling_gc_periodic():
+    setup_table(
+        "t_gc",
+        "projection_storage_format = 'flat', temporary_directories_lifetime = 60, "
+        "merge_tree_clear_old_temporary_directories_interval_seconds = 1",
+    )
+    data_root = "/".join(part_dir("t_gc").split("/")[:-1])
+    aged = f"{data_root}/gone_0_0_0.p.proj"
+    young = f"{data_root}/fresh_0_0_0.p.proj"
+    moving_aged = f"{data_root}/moving/gone_1_1_1.p.proj"
+    node.exec_in_container(
+        [
+            "bash",
+            "-c",
+            f"mkdir -p {aged} {young} {moving_aged} && touch -d '2 hours ago' {aged} {moving_aged}",
+        ],
+        privileged=True,
+        user="root",
+    )
+    # background cleanup runs only when there is work for the cleanup task
+    node.query("SYSTEM START MERGES t_gc")
+    node.query("INSERT INTO t_gc SELECT number, number, '' FROM numbers(10)")
+    node.query("OPTIMIZE TABLE t_gc FINAL")
+    wait_for(lambda: not path_exists(aged))
+    assert not path_exists(aged)
+    assert not path_exists(moving_aged)
+    assert path_exists(young)  # age guard: too young to reap
+    node.exec_in_container(
+        ["bash", "-c", f"rm -rf {young}"], privileged=True, user="root"
+    )
+
+
+# always_use_copy_instead_of_hardlinks carries the projection by copying; no inode is
+# shared with the source part and the zero-copy keep-list stays empty.
+def test_mutation_always_copy_flat():
+    # projection must not contain the mutated column, so the mutation carries it unchanged
+    node.query("DROP TABLE IF EXISTS t_copy SYNC")
+    node.query("SYSTEM STOP MERGES")
+    node.query(
+        """CREATE TABLE t_copy (key UInt64, id UInt64, value String,
+           PROJECTION p (SELECT key, id ORDER BY id))
+           ENGINE = MergeTree ORDER BY key
+           SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat',
+                    always_use_copy_instead_of_hardlinks = 1"""
+    )
+    node.query(
+        "INSERT INTO t_copy SELECT number, number * 2, toString(number) FROM numbers(1000)"
+    )
+    old_part = part_dir("t_copy")
+    node.query(
+        "ALTER TABLE t_copy UPDATE value = 'x' WHERE key = 1 SETTINGS mutations_sync = 2"
+    )
+    new_part = part_dir("t_copy")
+    assert new_part != old_part
+    assert path_exists(f"{new_part}.p.proj")
+    links = node.exec_in_container(
+        ["bash", "-c", f"stat -c %h {new_part}.p.proj/checksums.txt"],
+        privileged=True,
+        user="root",
+    ).strip()
+    assert links == "1"
+    assert check_table("t_copy") == "1"
+    assert proj_query("t_copy") != ""
+
+
+# The default hardlink path shares inodes and keeps the projection usable after the
+# source part is dropped (keep-list correctness).
+def test_mutation_hardlinks_flat_projection():
+    # projection must not contain the mutated column, so the mutation carries it unchanged
+    node.query("DROP TABLE IF EXISTS t_hl SYNC")
+    node.query("SYSTEM STOP MERGES")
+    node.query(
+        """CREATE TABLE t_hl (key UInt64, id UInt64, value String,
+           PROJECTION p (SELECT key, id ORDER BY id))
+           ENGINE = MergeTree ORDER BY key
+           SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat'"""
+    )
+    node.query(
+        "INSERT INTO t_hl SELECT number, number * 2, toString(number) FROM numbers(1000)"
+    )
+    node.query(
+        "ALTER TABLE t_hl UPDATE value = 'x' WHERE key = 1 SETTINGS mutations_sync = 2"
+    )
+    new_part = part_dir("t_hl")
+    links = node.exec_in_container(
+        ["bash", "-c", f"stat -c %h {new_part}.p.proj/checksums.txt"],
+        privileged=True,
+        user="root",
+    ).strip()
+    assert int(links) >= 2  # hardlinked from the source projection
+    # drop the source part from disk (outdated cleanup) and verify the new part still works
+    node.query("SYSTEM START MERGES t_hl")
+    wait_for(lambda: outdated_parts("t_hl") == "0", timeout=120)
+    assert check_table("t_hl") == "1"
+    assert proj_query("t_hl") != ""
+
+
+# A failed ATTACH (occupied attaching_ destination) rolls whole parts back; the
+# detached part and its sibling stay intact and a retry succeeds.
+def test_attach_rollback_restores_siblings():
+    setup_table("t_rollback", "projection_storage_format = 'flat'")
+    name = part_name("t_rollback")
+    node.query("ALTER TABLE t_rollback DETACH PARTITION tuple()")
+    detached_root = node.query(
+        "SELECT path FROM system.detached_parts WHERE table = 't_rollback' LIMIT 1"
+    ).strip()
+    if not detached_root:
+        detached_root = "/var/lib/clickhouse/data/default/t_rollback/detached"
+    else:
+        detached_root = detached_root.rstrip("/").rsplit("/", 1)[0]
+    assert path_exists(f"{detached_root}/{name}.p.proj")
+    # occupy the temporary rename destination to make tryRenameAll fail
+    node.exec_in_container(
+        ["bash", "-c", f"mkdir -p {detached_root}/attaching_{name}"],
+        privileged=True,
+        user="root",
+    )
+    assert "Exception" in node.query_and_get_error(
+        "ALTER TABLE t_rollback ATTACH PARTITION tuple()"
+    )
+    # nothing was lost or half-renamed
+    assert path_exists(f"{detached_root}/{name}")
+    assert path_exists(f"{detached_root}/{name}.p.proj")
+    node.exec_in_container(
+        ["bash", "-c", f"rmdir {detached_root}/attaching_{name}"],
+        privileged=True,
+        user="root",
+    )
+    node.query("ALTER TABLE t_rollback ATTACH PARTITION tuple()")
+    assert active_parts("t_rollback") == "1"
+    assert proj_query("t_rollback") != ""

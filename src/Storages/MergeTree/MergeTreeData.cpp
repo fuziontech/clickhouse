@@ -2609,7 +2609,7 @@ void MergeTreeData::loadDataParts(bool skip_sanity_checks, std::optional<std::un
             {
                 /// Skip temporary directories, projection directories, file 'format_version.txt' and directory 'detached'.
                 if (startsWith(it->name(), "tmp")
-                    || endsWith(it->name(), ".proj") || endsWith(it->name(), ".tmp_proj")
+                    || projectionDirNameType(it->name()) != ProjectionDirNameType::None
                     || it->name() == MergeTreeData::FORMAT_VERSION_FILE_NAME
                     || it->name() == DETACHED_DIR_NAME)
                     continue;
@@ -3467,7 +3467,7 @@ size_t MergeTreeData::clearOldTemporaryDirectories(size_t custom_directories_lif
     return cleared_count;
 }
 
-size_t MergeTreeData::clearOrphanProjectionSiblings()
+size_t MergeTreeData::clearOrphanProjectionSiblings(size_t max_age_seconds)
 {
     size_t cleared_count = 0;
 
@@ -3476,7 +3476,9 @@ size_t MergeTreeData::clearOrphanProjectionSiblings()
         if (disk->isBroken())
             continue;
 
-        for (const auto & root : {fs::path(relative_data_path), fs::path(relative_data_path) / DETACHED_DIR_NAME})
+        for (const auto & root : {fs::path(relative_data_path),
+                                  fs::path(relative_data_path) / DETACHED_DIR_NAME,
+                                  fs::path(relative_data_path) / "moving"})
         {
             if (!disk->existsDirectory(root))
                 continue;
@@ -3485,12 +3487,16 @@ size_t MergeTreeData::clearOrphanProjectionSiblings()
             for (auto it = disk->iterateDirectory(root); it->isValid(); it->next())
             {
                 const String entry = it->name();
-                if (!endsWith(entry, ".proj") && !endsWith(entry, ".tmp_proj"))
+                if (projectionDirNameType(entry) == ProjectionDirNameType::None)
                     continue;
 
-                /// Part dir names contain no dots, so everything before the first one is the owner part dir.
-                const String owner = entry.substr(0, entry.find('.'));
+                const String owner = projectionSiblingOwner(entry);
                 if (owner.empty() || disk->existsDirectory(root / owner))
+                    continue;
+
+                /// The rename commit window legitimately shows a sibling without its owner dir
+                /// (commit-last); a young orphan may still be adopted, so only reap aged ones.
+                if (max_age_seconds && disk->getLastModified(root / entry).epochTime() + time_t(max_age_seconds) > time(nullptr))
                     continue;
 
                 orphans.push_back(entry);
@@ -3499,7 +3505,7 @@ size_t MergeTreeData::clearOrphanProjectionSiblings()
             for (const auto & entry : orphans)
             {
                 LOG_WARNING(log, "Removing orphan projection directory {} whose part directory {} does not exist",
-                    fullPath(disk, root / entry), entry.substr(0, entry.find('.')));
+                    fullPath(disk, root / entry), projectionSiblingOwner(entry));
 
                 /// Do not remove blobs if they exist
                 disk->removeSharedRecursive(root / entry / "", true, {});
@@ -3557,10 +3563,10 @@ size_t MergeTreeData::clearOldTemporaryDirectories(const String & root_path, siz
                 {
                     ThreadFuzzer::maybeInjectSleep();
 
-                    /// A flat projection sibling is in use whenever its parent part is (part dir names contain no dots).
+                    /// A flat projection sibling is in use whenever its parent part is.
                     String in_use_name = basename;
-                    if (endsWith(basename, ".proj") || endsWith(basename, ".tmp_proj"))
-                        in_use_name = basename.substr(0, basename.find('.'));
+                    if (auto owner = projectionSiblingOwner(basename); !owner.empty())
+                        in_use_name = owner;
 
                     if (temporary_parts.contains(in_use_name))
                     {
@@ -5626,32 +5632,23 @@ void MergeTreeData::PartsTemporaryRename::tryRenameAll()
     renamed = true;
     for (size_t i = 0; i < old_and_new_names.size(); ++i)
     {
-        bool parent_renamed = false;
         try
         {
             const auto & [_, old_dir, new_dir, disk] = old_and_new_names[i];
             if (old_dir.empty() || new_dir.empty())
                 throw DB::Exception(ErrorCodes::LOGICAL_ERROR, "Empty part name. Most likely it's a bug.");
             const auto full_path = fs::path(storage.relative_data_path) / source_dir;
-            disk->moveDirectory(fs::path(full_path) / old_dir, fs::path(full_path) / new_dir);
-            parent_renamed = true;
 
-            /// Move FLAT projection siblings ("<old_dir>.<projection>.proj") alongside the part dir.
-            const String flat_prefix = old_dir + ".";
-            Strings flat_siblings;
-            for (auto it = disk->iterateDirectory(full_path); it->isValid(); it->next())
-            {
-                const String entry = it->name();
-                if (startsWith(entry, flat_prefix) && (endsWith(entry, ".proj") || endsWith(entry, ".tmp_proj")))
-                    flat_siblings.push_back(entry);
-            }
-            for (const auto & entry : flat_siblings)
-                disk->moveDirectory(fs::path(full_path) / entry, fs::path(full_path) / (new_dir + entry.substr(old_dir.size())));
+            /// Storage-level rename supplies sibling enumeration (from disk truth), the
+            /// stale-destination sweep and the commit-last ordering.
+            auto part_storage = std::make_shared<DataPartStorageOnDiskFull>(
+                std::make_shared<SingleDiskVolume>("volume_" + old_dir, disk, 0), full_path, old_dir);
+            part_storage->setProjections(part_storage->detectProjections());
+            part_storage->rename(full_path, new_dir, storage.log.load(), /*remove_new_dir_if_exists=*/ false, /*fsync_part_dir=*/ false);
         }
         catch (...)
         {
-            /// Keep a half-renamed entry so rollBackAll reverts the already-moved parent dir.
-            old_and_new_names.resize(parent_renamed ? i + 1 : i);
+            old_and_new_names.resize(i);
             LOG_WARNING(storage.log, "Cannot rename parts to perform operation on them: {}", getCurrentExceptionMessage(false));
             throw;
         }
@@ -5674,19 +5671,10 @@ void MergeTreeData::PartsTemporaryRename::rollBackAll()
         try
         {
             const String full_path = fs::path(storage.relative_data_path) / source_dir;
-            disk->moveFile(fs::path(full_path) / new_dir, fs::path(full_path) / old_dir);
-
-            /// Roll back FLAT projection siblings moved in tryRenameAll ("<new_dir>.<projection>.proj").
-            const String flat_prefix = new_dir + ".";
-            Strings flat_siblings;
-            for (auto it = disk->iterateDirectory(full_path); it->isValid(); it->next())
-            {
-                const String entry = it->name();
-                if (startsWith(entry, flat_prefix) && (endsWith(entry, ".proj") || endsWith(entry, ".tmp_proj")))
-                    flat_siblings.push_back(entry);
-            }
-            for (const auto & entry : flat_siblings)
-                disk->moveFile(fs::path(full_path) / entry, fs::path(full_path) / (old_dir + entry.substr(new_dir.size())));
+            auto part_storage = std::make_shared<DataPartStorageOnDiskFull>(
+                std::make_shared<SingleDiskVolume>("volume_" + new_dir, disk, 0), full_path, new_dir);
+            part_storage->setProjections(part_storage->detectProjections());
+            part_storage->rename(full_path, old_dir, storage.log.load(), /*remove_new_dir_if_exists=*/ false, /*fsync_part_dir=*/ false);
         }
         catch (...)
         {
@@ -7762,7 +7750,7 @@ MergeTreeData::PartsBackupEntries MergeTreeData::backupParts(
         part->getDataPartStorage().backup(
             part->checksums,
             part->getFileNamesWithoutChecksums(),
-            data_path_in_backup,
+            fs::path{data_path_in_backup} / part->name,
             backup_settings,
             make_temporary_hard_links,
             backup_entries_from_part,
@@ -7772,12 +7760,12 @@ MergeTreeData::PartsBackupEntries MergeTreeData::backupParts(
 
         auto backup_projection = [&](IDataPartStorage & storage, IMergeTreeDataPart & projection_part)
         {
-            /// The projection storage backs up under its logical name ("<name>.proj") itself (see
-            /// IDataPartStorage::backup), so the backup layout is independent of the on-disk layout.
+            /// A projection backs up under its logical name ("<name>.proj"), so the backup layout
+            /// is independent of the on-disk projection layout.
             storage.backup(
                 projection_part.checksums,
                 projection_part.getFileNamesWithoutChecksums(),
-                fs::path{data_path_in_backup} / part->name,
+                fs::path{data_path_in_backup} / part->name / (projection_part.name + ".proj"),
                 backup_settings,
                 make_temporary_hard_links,
                 backup_entries_from_part,
@@ -8688,7 +8676,7 @@ DetachedPartsInfo MergeTreeData::getDetachedParts() const
             Strings sibling_names;
             for (auto it = disk->iterateDirectory(detached_path); it->isValid(); it->next())
             {
-                if (endsWith(it->name(), ".proj") || endsWith(it->name(), ".tmp_proj"))
+                if (projectionDirNameType(it->name()) != ProjectionDirNameType::None)
                 {
                     sibling_names.push_back(it->name());
                     continue;
@@ -8698,8 +8686,7 @@ DetachedPartsInfo MergeTreeData::getDetachedParts() const
             }
             for (const auto & sibling : sibling_names)
             {
-                /// Detached dir names contain no dots, so everything before the first one is the owner.
-                auto owner = index_by_dir_name.find(sibling.substr(0, sibling.find('.')));
+                auto owner = index_by_dir_name.find(projectionSiblingOwner(sibling));
                 /// An orphan sibling (owner gone) stays unlisted; clearOrphanProjectionSiblings reaps it.
                 if (owner != index_by_dir_name.end())
                     res[owner->second].projection_siblings.push_back(sibling);
@@ -10168,20 +10155,9 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> MergeTreeData::cloneAn
     if (params.copy_instead_of_hardlink)
         with_copy = " (copying data)";
 
-    /// freeze/freezeRemote copy the owned FLAT projection siblings themselves (from the source
-    /// storage's projection cache); no owned-set needs to be threaded through params.
-    std::shared_ptr<IDataPartStorage> dst_part_storage{};
-    if (on_same_disk)
-    {
-        dst_part_storage = src_part_storage->freeze(
-            relative_data_path,
-            tmp_dst_part_name,
-            read_settings,
-            write_settings,
-            /* save_metadata_callback= */ {},
-            params);
-    }
-    else
+    /// freeze also copies the part's owned FLAT projection siblings.
+    DiskPtr dst_disk;
+    if (!on_same_disk)
     {
         auto reservation_on_dst_or_error = getStoragePolicy()->reserve(src_part->getBytesOnDisk());
         if (!reservation_on_dst_or_error)
@@ -10189,15 +10165,16 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> MergeTreeData::cloneAn
             const auto & error = reservation_on_dst_or_error.error();
             throw Exception(error.message, error.code);
         }
-        dst_part_storage = src_part_storage->freezeRemote(
-            relative_data_path,
-            tmp_dst_part_name,
-            /* dst_disk = */ (*reservation_on_dst_or_error)->getDisk(),
-            read_settings,
-            write_settings,
-            /* save_metadata_callback= */ {},
-            params);
+        dst_disk = (*reservation_on_dst_or_error)->getDisk();
     }
+    std::shared_ptr<IDataPartStorage> dst_part_storage = src_part_storage->freeze(
+        relative_data_path,
+        tmp_dst_part_name,
+        dst_disk,
+        read_settings,
+        write_settings,
+        /* save_metadata_callback= */ {},
+        params);
 
     if (params.metadata_version_to_write.has_value())
     {
@@ -10470,6 +10447,7 @@ PartitionCommandsResultInfo MergeTreeData::freezePartitionsByMatcher(
                 auto new_storage = data_part_storage->freeze(
                     backup_part_path,
                     part->getDataPartStorage().getPartDirectory(),
+                    /* dst_disk= */ nullptr,
                     local_context->getReadSettings(),
                     local_context->getWriteSettings(),
                     callback,
@@ -10528,10 +10506,9 @@ bool MergeTreeData::removeDetachedPart(DiskPtr disk, const String & path, const 
 void MergeTreeData::removeDetachedProjectionSiblings(const DiskPtr & disk, const String & dir_name, bool keep_shared)
 {
     fs::path detached_root = fs::path(relative_data_path) / DETACHED_DIR_NAME;
-    const String prefix = dir_name + ".";
     Strings siblings;
     for (auto it = disk->iterateDirectory(detached_root); it->isValid(); it->next())
-        if (startsWith(it->name(), prefix) && (endsWith(it->name(), ".proj") || endsWith(it->name(), ".tmp_proj")))
+        if (projectionSiblingOwner(it->name()) == dir_name)
             siblings.push_back(it->name());
 
     for (const auto & name : siblings)

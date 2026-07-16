@@ -24,8 +24,11 @@ public:
 
     ProjectionEntries getProjections() const override;
     ProjectionEntries detectProjections() const override;
-    void addProjectionEntry(const std::string & name, ProjectionEntry entry) override;
-    void setProjectionsReady() override;
+    void setProjections(ProjectionEntries entries) override;
+
+    void removeTempProjection(const std::string & name) override;
+    void renameProjection(const std::string & old_name, const std::string & new_name) override;
+    void syncProjectionStoragePath(const std::string & name, IDataPartStorage & projection_storage) const override;
 
     ProjectionStorageFormat getProjectionStorageFormat() const override { return projection_storage_format; }
     void setProjectionStorageFormat(ProjectionStorageFormat format) override
@@ -140,19 +143,11 @@ public:
     MutableDataPartStoragePtr freeze(
         const std::string & to,
         const std::string & dir_path,
+        const DiskPtr & dst_disk,
         const ReadSettings & read_settings,
         const WriteSettings & write_settings,
         std::function<void(const DiskPtr &)> save_metadata_callback,
         const ClonePartParams & params) const override;
-
-    MutableDataPartStoragePtr freezeRemote(
-    const std::string & to,
-    const std::string & dir_path,
-    const DiskPtr & dst_disk,
-    const ReadSettings & read_settings,
-    const WriteSettings & write_settings,
-    std::function<void(const DiskPtr &)> save_metadata_callback,
-    const ClonePartParams & params) const override;
 
     MutableDataPartStoragePtr clonePart(
         const std::string & to,
@@ -209,6 +204,11 @@ protected:
     /// root_path/part_dir. Single source of truth, so ProjectionEntry need store only the format.
     std::pair<std::string, std::string> getProjectionStorageRootAndDir(const std::string & name, ProjectionStorageFormat format) const;
 
+    /// Incremental owned-set updates for createProjection/renameProjection/removeTempProjection;
+    /// require an already-seeded set.
+    void addProjection(const std::string & name, ProjectionEntry entry);
+    void dropProjection(const std::string & name);
+
     /// Lazily load the per-part skp_idx.packed archive (if any), reading it as a standalone disk
     /// file. Subsequent calls return the cached reader, or nullptr when there is no such file --
     /// including on storages that don't keep skp_idx.packed standalone (e.g. packed part storage,
@@ -263,12 +263,8 @@ protected:
     /// Layout for projection directories created through this storage.
     ProjectionStorageFormat projection_storage_format = ProjectionStorageFormat::NONE;
 
-    /// Logical projection name ("<name>.proj") when this storage is a projection sub-part; empty
-    /// otherwise. Set by getProjection so backup() can write under the layout-independent name.
-    std::string projection_logical_name;
-
-    /// Cached projection entries. ready=false: never scanned; ready=true: authoritative (absent key = no
-    /// projection). Seeded from the manifest at load (owned set); paths derived, so only setRelativePath drops it.
+    /// The owned projection set. ready=false: never seeded (reads throw); ready=true: authoritative
+    /// (absent key = no projection). Paths are derived, so only setRelativePath drops it.
     mutable std::mutex projection_entries_mutex;
     mutable bool projection_entries_ready TSA_GUARDED_BY(projection_entries_mutex) = false;
     mutable ProjectionEntries projection_entries TSA_GUARDED_BY(projection_entries_mutex);

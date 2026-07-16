@@ -1,6 +1,7 @@
 #include <Storages/Freeze.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
+#include <Storages/MergeTree/IDataPartStorage.h>
 #include <Storages/PartitionCommands.h>
 #include <Interpreters/Context.h>
 #include <Common/escapeForFileName.h>
@@ -218,6 +219,11 @@ PartitionCommandsResultInfo Unfreezer::unfreezePartitionsFromTableDirectory(Merg
         {
             const auto & partition_directory = it->name();
 
+            /// FLAT projection siblings are not parts: each is removed with its owner below,
+            /// under the owner's keep_shared decision.
+            if (projectionDirNameType(partition_directory) != ProjectionDirNameType::None)
+                continue;
+
             /// Partition ID is prefix of part directory name: <partition id>_<rest of part directory name>
             auto found = partition_directory.find('_');
             if (found == std::string::npos)
@@ -230,6 +236,14 @@ PartitionCommandsResultInfo Unfreezer::unfreezePartitionsFromTableDirectory(Merg
             const auto & path = it->path();
 
             bool keep_shared = removeFrozenPart(disk, path, partition_directory, local_context, zookeeper);
+
+            for (auto sibling_it = disk->iterateDirectory(table_directory); sibling_it->isValid(); sibling_it->next())
+            {
+                if (projectionSiblingOwner(sibling_it->name()) != partition_directory)
+                    continue;
+                disk->removeSharedRecursive(fs::path(table_directory) / sibling_it->name() / "", keep_shared, {});
+                LOG_DEBUG(log, "Unfrozen projection sibling {} of part {}, keep shared data: {}", sibling_it->name(), partition_directory, keep_shared);
+            }
 
             result.push_back(PartitionCommandResultInfo{
                 .command_type = "UNFREEZE PART",

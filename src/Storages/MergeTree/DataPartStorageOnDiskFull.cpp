@@ -9,6 +9,7 @@
 #include <IO/WriteBufferFromFileBase.h>
 #include <Interpreters/Context.h>
 #include <Storages/MergeTree/MergeTreeIndicesSerialization.h>
+#include <Common/logger_useful.h>
 #include <Common/typeid_cast.h>
 
 namespace DB
@@ -60,14 +61,13 @@ MutableDataPartStoragePtr DataPartStorageOnDiskFull::getProjection(const std::st
         format = it->second.format;
     else
     {
-        /// Not on disk yet: this handle is about to create it (merge tmp part, fetch, mutation).
-        /// Use the configured layout and register it so a later rename/remove of this part covers it.
+        /// Not owned: resolve where the dir would live (e.g. a broken-projection placeholder) without
+        /// registering anything; directories come into existence only through createProjection.
         format = getProjectionStorageFormat();
         if (format == ProjectionStorageFormat::NONE)
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "Cannot choose a layout for projection {} in part {}: storage has no projection storage format configured",
                 name, getRelativePath());
-        addProjectionEntry(name, {format, name.ends_with(".tmp_proj")});
     }
 
     auto [proj_root, proj_dir] = getProjectionStorageRootAndDir(name, format);
@@ -78,7 +78,8 @@ MutableDataPartStoragePtr DataPartStorageOnDiskFull::getProjection(const std::st
         use_parent_transaction ? transaction : nullptr));
     /// copy parent's projection format
     projection_storage->projection_storage_format = projection_storage_format;
-    projection_storage->projection_logical_name = name;
+    /// A projection sub-part owns no projections of its own.
+    projection_storage->setProjections({});
     return projection_storage;
 }
 
@@ -90,7 +91,7 @@ DataPartStoragePtr DataPartStorageOnDiskFull::getProjection(const std::string & 
         format = it->second.format;
     else
     {
-        /// Const path cannot register the entry; it only resolves the location for a read-only handle.
+        /// See the mutable overload: resolve the location without registering anything.
         format = getProjectionStorageFormat();
         if (format == ProjectionStorageFormat::NONE)
             throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -104,7 +105,7 @@ DataPartStoragePtr DataPartStorageOnDiskFull::getProjection(const std::string & 
         std::move(proj_root),
         std::move(proj_dir));
     projection_storage->projection_storage_format = projection_storage_format;
-    projection_storage->projection_logical_name = name;
+    projection_storage->setProjections({});
     return projection_storage;
 }
 
@@ -299,9 +300,19 @@ void DataPartStorageOnDiskFull::createProjection(const std::string & name)
             "Cannot create projection {} in part {}: storage has no projection storage format configured",
             name, getRelativePath());
     const auto [proj_root, proj_dir] = getProjectionStorageRootAndDir(name, format);
+
+    /// A leftover directory is residue of a failed operation on a same-named part (tmp part names repeat).
+    auto disk_ptr = volume->getDisk();
+    if (disk_ptr->existsDirectory(fs::path(proj_root) / proj_dir))
+    {
+        LOG_WARNING(getLogger("DataPartStorageOnDiskFull"), "Removing stale projection directory {} before creating projection {}",
+            fullPath(disk_ptr, fs::path(proj_root) / proj_dir), name);
+        /// Do not remove blobs if they exist
+        disk_ptr->removeSharedRecursive(fs::path(proj_root) / proj_dir / "", true, {});
+    }
+
     executeWriteOperation([&](auto & disk) { disk.createDirectory(fs::path(proj_root) / proj_dir); });
-    /// The projection now exists on disk; record it so getProjections() and a later rename/remove see it.
-    addProjectionEntry(name, {format, name.ends_with(".tmp_proj")});
+    addProjection(name, {format, projectionDirNameType(name) == ProjectionDirNameType::Temp});
 }
 
 void DataPartStorageOnDiskFull::beginTransaction()

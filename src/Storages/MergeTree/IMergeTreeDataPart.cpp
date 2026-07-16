@@ -1408,13 +1408,18 @@ void IMergeTreeDataPart::loadProjections(
 
     auto metadata_snapshot = storage.getInMemoryMetadataPtr(storage.getContext(), false);
 
-    /// Seed the owned-projection cache from disk: a metadata projection or checksums `.proj` entry present
-    /// on disk is owned; residue (present but undeclared and unchecksummed) is left out. Authoritative after.
-    auto detected_projections = getDataPartStorage().detectProjections();
+    /// Owned = on-disk dirs referenced by the checksums (survives DROP PROJECTION from the metadata)
+    /// or declared in the metadata; residue and `.tmp_proj` dirs stay out.
+    const auto detected_projections = getDataPartStorage().detectProjections();
+    IDataPartStorage::ProjectionEntries owned_projections;
     for (const auto & [file_name, _] : checksums.files)
         if (file_name.ends_with(".proj"))
             if (auto it = detected_projections.find(file_name); it != detected_projections.end())
-                getDataPartStorage().addProjectionEntry(file_name, it->second);
+                owned_projections.emplace(it->first, it->second);
+    for (const auto & projection : metadata_snapshot->projections)
+        if (auto it = detected_projections.find(projection.name + ".proj"); it != detected_projections.end())
+            owned_projections.emplace(it->first, it->second);
+    getDataPartStorage().setProjections(std::move(owned_projections));
 
     for (const auto & projection : metadata_snapshot->projections)
     {
@@ -1423,8 +1428,6 @@ void IMergeTreeDataPart::loadProjections(
         /// TODO: also decide if to WARN here if detected_projections has some projections which are not in the metadata/checksums
         if (detected_it != detected_projections.end())
         {
-            getDataPartStorage().addProjectionEntry(projection_path, detected_it->second);
-
             /// Membership is decided by the parent directory's presence; an unlisted projection means
             /// some operation diverged from the manifest and deserves a trace.
             if (!checksums.empty() && !checksums.has(projection_path))
@@ -1473,10 +1476,6 @@ void IMergeTreeDataPart::loadProjections(
             has_broken_projection = true;
         }
     }
-
-    /// Mark authoritative even when the part has no projections, so getProjections() will not fall
-    /// back to a disk scan that could pick up residue.
-    getDataPartStorage().setProjectionsReady();
 }
 
 void IMergeTreeDataPart::loadIndexGranularity()
@@ -1871,8 +1870,9 @@ void IMergeTreeDataPart::loadChecksums(bool require)
         for (const auto & projection : metadata_snapshot->projections)
             declared_projections.insert(projection.name + ".proj");
 
-        static constexpr auto projection_checksums_file = "checksums.txt";
-        /// The cache is not seeded here (this is the manifest-less path), so scan disk directly.
+        /// Manifest-less path: ownership comes from disk truth. Seed before reading so getProjection
+        /// resolves each dir's actual layout; loadProjections re-seeds against the restored checksums.
+        IDataPartStorage::ProjectionEntries restored_projections;
         for (const auto & [projection_name, entry] : getDataPartStorage().detectProjections())
         {
             if (entry.is_temp)
@@ -1885,6 +1885,13 @@ void IMergeTreeDataPart::loadChecksums(bool require)
                 continue;
             }
 
+            restored_projections.emplace(projection_name, entry);
+        }
+        getDataPartStorage().setProjections(restored_projections);
+
+        static constexpr auto projection_checksums_file = "checksums.txt";
+        for (const auto & [projection_name, entry] : restored_projections)
+        {
             auto projection_storage = getDataPartStorage().getProjection(projection_name);
             if (!projection_storage->existsFile(projection_checksums_file))
                 continue;
@@ -2357,53 +2364,29 @@ bool IMergeTreeDataPart::shallParticipateInMerges(const StoragePolicyPtr & stora
 
 void IMergeTreeDataPart::renameTo(const String & new_relative_path, bool remove_new_dir_if_exists)
 {
-    std::string relative_path = storage.relative_data_path;
-    bool fsync_dir = (*storage.getSettings())[MergeTreeSetting::fsync_part_directory];
-
-    /// getRelativePath() appends a trailing slash; drop it so filename()/parent_path() behave.
-    auto strip_slash = [](std::string p) { if (!p.empty() && p.back() == '/') p.pop_back(); return p; };
-    /// A flat projection sits beside its parent as "<parent_dir>.<name>"; a nested one is a child "<name>".
-    auto is_flat_projection = [](const fs::path & projection_dir, const std::string & parent_dir_name)
-    { return projection_dir.filename().string().starts_with(parent_dir_name + "."); };
-
-    fs::path to;
     if (parent_part)
     {
-        /// This part is a projection: it lives inside the parent dir (nested) or beside it (flat).
-        fs::path parent_rel = strip_slash(parent_part->getDataPartStorage().getRelativePath());
-        fs::path this_rel = strip_slash(getDataPartStorage().getRelativePath());
-        if (is_flat_projection(this_rel, parent_rel.filename().string()))
-            to = parent_rel.parent_path() / (parent_rel.filename().string() + "." + new_relative_path);
-        else
-            to = parent_rel / new_relative_path;
+        /// This part is a projection: it renames within its parent (e.g. "p_1.tmp_proj" -> "p.proj").
+        /// The parent's storage resolves both dir names from its owned set and keeps that set true.
+        auto & parent_storage = const_cast<IMergeTreeDataPart *>(parent_part)->getDataPartStorage();
+        parent_storage.renameProjection(name + (is_temp ? ".tmp_proj" : ".proj"), new_relative_path);
+        parent_storage.syncProjectionStoragePath(new_relative_path, getDataPartStorage());
+        return;
     }
-    else
-        to = fs::path(relative_path) / new_relative_path;
 
-    auto old_projection_root_path = strip_slash(getDataPartStorage().getRelativePath());
+    bool fsync_dir = (*storage.getSettings())[MergeTreeSetting::fsync_part_directory];
+    fs::path to = fs::path(storage.relative_data_path) / new_relative_path;
 
     /// rename() moves FLAT projection siblings with the part and decides the parent/sibling move
     /// order itself from the destination (see IDataPartStorage::rename).
     getDataPartStorage().rename(to.parent_path(), to.filename(), storage.log.load(), remove_new_dir_if_exists, fsync_dir);
 
-    auto new_projection_root_path = to.string();
-
-    /// Update in-memory projection storage paths to match the moved part. Layout is detected per child
-    /// from its on-disk dir name, so this needs no configured format.
-    auto old_parent_name = fs::path(old_projection_root_path).filename().string();
+    /// Repoint in-memory projection storages at the moved part. A broken projection whose dir is
+    /// lost has an in-memory placeholder part but no owned dir, so there is nothing to repoint.
+    const auto owned_projections = getDataPartStorage().getProjections();
     for (const auto & [projection_name, part] : projection_parts)
-    {
-        fs::path child_rel = strip_slash(part->getDataPartStorage().getRelativePath());
-        if (is_flat_projection(child_rel, old_parent_name))
-        {
-            /// A flat sibling's root is the part's root (the table data path); only the subdirectory and
-            /// basename change. Move the root to the renamed part's parent, then set the flat basename.
-            part->getDataPartStorage().changeRootPath(relative_path, to.parent_path());
-            part->getDataPartStorage().setRelativePath(to.filename().string() + "." + projection_name + ".proj");
-        }
-        else
-            part->getDataPartStorage().changeRootPath(old_projection_root_path, new_projection_root_path);
-    }
+        if (owned_projections.contains(projection_name + ".proj"))
+            getDataPartStorage().syncProjectionStoragePath(projection_name + ".proj", part->getDataPartStorage());
 }
 
 std::pair<bool, NameSet> IMergeTreeDataPart::canRemovePart() const
@@ -2436,16 +2419,16 @@ void IMergeTreeDataPart::remove()
     chassert(assertHasValidVersionMetadata());
     part_is_probably_removed_from_disk = true;
 
+    /// Temporary projections are transient by-products of projections materialization and can always
+    /// be removed. Go through the parent so its owned set drops the entry together with the dir.
+    if (isProjectionPart() && is_temp)
+    {
+        const_cast<IMergeTreeDataPart *>(parent_part)->getDataPartStorage().removeTempProjection(name + ".tmp_proj");
+        return;
+    }
+
     auto can_remove_callback = [this] ()
     {
-        /// Temporary projections are "subparts" which are generated during projections materialization
-        /// We can always remove them without any additional checks.
-        if (isProjectionPart() && is_temp)
-        {
-            LOG_TRACE(storage.log, "Temporary projection part {} can be removed", name);
-            return CanRemoveDescription{.can_remove_anything = true, .files_not_to_remove = {} };
-        }
-
         auto [can_remove, files_not_to_remove] = canRemovePart();
         if (!can_remove)
             LOG_TRACE(storage.log, "Blobs of part {} cannot be removed", name);
@@ -2458,7 +2441,7 @@ void IMergeTreeDataPart::remove()
 
     /// Projections should be never removed by themselves, they will be removed
     /// with by parent part.
-    if (isProjectionPart() && !is_temp)
+    if (isProjectionPart())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Projection part {} should be removed by its parent {}", name, parent_part_name);
 
     std::list<IDataPartStorage::ProjectionChecksums> projection_checksums;
@@ -2567,6 +2550,7 @@ DataPartStoragePtr IMergeTreeDataPart::makeCloneInDetached(const String & prefix
     return getDataPartStorage().freeze(
         storage.relative_data_path,
         *maybe_path_in_detached,
+        /* dst_disk= */ nullptr,
         Context::getGlobalContextInstance()->getReadSettings(),
         Context::getGlobalContextInstance()->getWriteSettings(),
         /* save_metadata_callback= */ {},

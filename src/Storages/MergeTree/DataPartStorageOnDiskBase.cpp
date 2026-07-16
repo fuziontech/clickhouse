@@ -24,6 +24,7 @@
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeDataPartChecksum.h>
 #include <Storages/MergeTree/MergeTreeIndicesSerialization.h>
+#include <Common/assert_cast.h>
 #include <Common/formatReadable.h>
 #include <Common/logger_useful.h>
 
@@ -49,6 +50,28 @@ std::unique_ptr<ReadBufferFromFileBase> IDataPartStorage::readFile(
     ReadPipeline pipeline;
     prepareRead(name, settings, read_hint, pipeline);
     return pipeline.build();
+}
+
+ProjectionDirNameType projectionDirNameType(std::string_view dir_name)
+{
+    if (dir_name.ends_with(".tmp_proj"))
+        return ProjectionDirNameType::Temp;
+    if (dir_name.ends_with(".proj"))
+        return ProjectionDirNameType::Normal;
+    return ProjectionDirNameType::None;
+}
+
+String projectionSiblingOwner(std::string_view dir_name)
+{
+    if (projectionDirNameType(dir_name) == ProjectionDirNameType::None)
+        return "";
+
+    auto first_dot = dir_name.find('.');
+    /// "<name>.proj" without an owner prefix is a nested dir name, not a sibling.
+    auto owner = dir_name.substr(0, first_dot);
+    if (owner.empty() || projectionDirNameType(dir_name.substr(first_dot + 1)) == ProjectionDirNameType::None)
+        return "";
+    return String(owner);
 }
 
 DataPartStorageOnDiskBase::DataPartStorageOnDiskBase(
@@ -417,9 +440,9 @@ void DataPartStorageOnDiskBase::backup(
     bool allow_backup_broken_projection) const
 {
     fs::path part_path_on_disk = fs::path{root_path} / part_dir;
-    /// A projection storage backs up under its logical name ("<name>.proj"), not its on-disk dir name
-    /// (FLAT is "<part_dir>.<name>.proj"), so the backup layout is independent of the on-disk layout.
-    fs::path part_path_in_backup = fs::path{path_in_backup} / (projection_logical_name.empty() ? part_dir : projection_logical_name);
+    /// The full destination dir comes from the caller: a projection goes under its logical name
+    /// ("<name>.proj"), never under its on-disk dir name (FLAT is "<part_dir>.<name>.proj").
+    fs::path part_path_in_backup = path_in_backup;
 
     auto disk = volume->getDisk();
 
@@ -522,113 +545,25 @@ void DataPartStorageOnDiskBase::backup(
 MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
     const std::string & to,
     const std::string & dir_path,
-    const ReadSettings & read_settings,
-    const WriteSettings & write_settings,
-    std::function<void(const DiskPtr &)> save_metadata_callback,
-    const ClonePartParams & params) const
-{
-    auto disk = volume->getDisk();
-    if (params.external_transaction)
-        params.external_transaction->createDirectories(to);
-    else
-        disk->createDirectories(to);
-
-    /// LEGACY_NESTED projections are copied with the main part; FLAT projections are sibling dirs and
-    /// must be copied separately. getProjections() is the owned set (residue siblings are absent).
-    for (const auto & [projection_name, entry] : getProjections())
-    {
-        if (entry.format != ProjectionStorageFormat::FLAT || entry.is_temp)
-            continue;
-
-        auto [proj_root, proj_dir] = getProjectionStorageRootAndDir(projection_name, entry.format);
-
-        /// A leftover directory at the destination is residue of a failed operation on a same-named part.
-        String proj_dst = fs::path(to) / (dir_path + "." + projection_name);
-        if (disk->existsDirectory(proj_dst))
-        {
-            LOG_WARNING(getLogger("DataPartStorageOnDiskBase"), "Removing stale projection directory {} at freeze destination", fullPath(disk, proj_dst));
-            /// Do not remove blobs if they exist
-            disk->removeSharedRecursive(fs::path(proj_dst) / "", true, {});
-        }
-
-        Backup(
-            disk,
-            disk,
-            fs::path(proj_root) / proj_dir,
-            proj_dst,
-            read_settings,
-            write_settings,
-            params.make_source_readonly,
-            {},
-            params.copy_instead_of_hardlink,
-            params.files_to_copy_instead_of_hardlinks,
-            params.external_transaction);
-    }
-    Backup(
-        disk,
-        disk,
-        getRelativePath(),
-        fs::path(to) / dir_path,
-        read_settings,
-        write_settings,
-        params.make_source_readonly,
-        {},
-        params.copy_instead_of_hardlink,
-        params.files_to_copy_instead_of_hardlinks,
-        params.external_transaction);
-
-
-    if (save_metadata_callback)
-        save_metadata_callback(disk);
-
-    /// Also remove any leftover `txn_version.txt.tmp`: leaving it without the main file makes the
-    /// cloned/frozen part load as a rolled-back transaction (see `VersionMetadataOnDisk::loadMetadata`)
-    /// and get discarded as `Outdated`. Remove the temporary file before the main file so the cleanup
-    /// is fail-closed: a failure between the two removals leaves a valid `txn_version.txt` rather than
-    /// the dangerous tmp-only state.
-    if (params.external_transaction)
-    {
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / "delete-on-destroy.txt");
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TMP_TXN_VERSION_METADATA_FILE_NAME);
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
-        if (!params.keep_metadata_version)
-            params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME);
-    }
-    else
-    {
-        disk->removeFileIfExists(fs::path(to) / dir_path / "delete-on-destroy.txt");
-        disk->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TMP_TXN_VERSION_METADATA_FILE_NAME);
-        disk->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
-        if (!params.keep_metadata_version)
-            disk->removeFileIfExists(fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME);
-    }
-
-    auto single_disk_volume = std::make_shared<SingleDiskVolume>(disk->getName(), disk, 0);
-
-    /// Do not initialize storage in case of DETACH because part may be broken.
-    bool to_detached = dir_path.starts_with(std::string_view((fs::path(MergeTreeData::DETACHED_DIR_NAME) / "").string()));
-    return create(
-        single_disk_volume, to, dir_path,
-        /*initialize=*/ !to_detached && !params.external_transaction);
-}
-
-MutableDataPartStoragePtr DataPartStorageOnDiskBase::freezeRemote(
-    const std::string & to,
-    const std::string & dir_path,
-    const DiskPtr & dst_disk,
+    const DiskPtr & dst_disk_,
     const ReadSettings & read_settings,
     const WriteSettings & write_settings,
     std::function<void(const DiskPtr &)> save_metadata_callback,
     const ClonePartParams & params) const
 {
     auto src_disk = volume->getDisk();
+    auto dst_disk = dst_disk_ ? dst_disk_ : src_disk;
+    /// A remote destination cannot hardlink, so it always copies everything
+    /// (files_to_copy_instead_of_hardlinks is then irrelevant).
+    const bool copy_instead_of_hardlink = params.copy_instead_of_hardlink || dst_disk != src_disk;
+
     if (params.external_transaction)
         params.external_transaction->createDirectories(to);
     else
         dst_disk->createDirectories(to);
 
-    /// LEGACY_NESTED projections are copied with the main part; FLAT projections are sibling dirs and
-    /// must be copied separately. getProjections() is the owned set (residue siblings are absent).
+    /// LEGACY_NESTED projections copy with the main part dir; FLAT siblings copy separately,
+    /// before it (commit-last). The owned set excludes residue of an unrelated same-named part.
     for (const auto & [projection_name, entry] : getProjections())
     {
         if (entry.format != ProjectionStorageFormat::FLAT || entry.is_temp)
@@ -654,12 +589,10 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freezeRemote(
             write_settings,
             params.make_source_readonly,
             {},
-            true,
-            {},
+            copy_instead_of_hardlink,
+            params.files_to_copy_instead_of_hardlinks,
             params.external_transaction);
     }
-    /// freezeRemote() using copy instead of hardlinks for all files
-    /// In this case, files_to_copy_intead_of_hardlinks is set by empty
     Backup(
         src_disk,
         dst_disk,
@@ -669,11 +602,11 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freezeRemote(
         write_settings,
         params.make_source_readonly,
         {},
-        true,
-        {},
+        copy_instead_of_hardlink,
+        params.files_to_copy_instead_of_hardlinks,
         params.external_transaction);
 
-    /// The save_metadata_callback function acts on the target dist.
+    /// The save_metadata_callback function acts on the target disk.
     if (save_metadata_callback)
         save_metadata_callback(dst_disk);
 
@@ -682,30 +615,34 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freezeRemote(
     /// and get discarded as `Outdated`. Remove the temporary file before the main file so the cleanup
     /// is fail-closed: a failure between the two removals leaves a valid `txn_version.txt` rather than
     /// the dangerous tmp-only state.
-    if (params.external_transaction)
+    auto remove_file_if_exists = [&](const String & file_name)
     {
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / "delete-on-destroy.txt");
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TMP_TXN_VERSION_METADATA_FILE_NAME);
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
-        if (!params.keep_metadata_version)
-            params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME);
-    }
-    else
-    {
-        dst_disk->removeFileIfExists(fs::path(to) / dir_path / "delete-on-destroy.txt");
-        dst_disk->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TMP_TXN_VERSION_METADATA_FILE_NAME);
-        dst_disk->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
-        if (!params.keep_metadata_version)
-            dst_disk->removeFileIfExists(fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME);
-    }
+        if (params.external_transaction)
+            params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / file_name);
+        else
+            dst_disk->removeFileIfExists(fs::path(to) / dir_path / file_name);
+    };
+    remove_file_if_exists("delete-on-destroy.txt");
+    remove_file_if_exists(VersionMetadata::TMP_TXN_VERSION_METADATA_FILE_NAME);
+    remove_file_if_exists(VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
+    if (!params.keep_metadata_version)
+        remove_file_if_exists(IMergeTreeDataPart::METADATA_VERSION_FILE_NAME);
 
     auto single_disk_volume = std::make_shared<SingleDiskVolume>(dst_disk->getName(), dst_disk, 0);
 
     /// Do not initialize storage in case of DETACH because part may be broken.
     bool to_detached = dir_path.starts_with(std::string_view((fs::path(MergeTreeData::DETACHED_DIR_NAME) / "").string()));
-    return create(
+    auto new_storage = create(
         single_disk_volume, to, dir_path,
         /*initialize=*/ !to_detached && !params.external_transaction);
+
+    /// The copy owns exactly what the source owned (temps are transient state and not copied).
+    ProjectionEntries copied;
+    for (const auto & [name, entry] : getProjections())
+        if (!entry.is_temp)
+            copied.emplace(name, entry);
+    new_storage->setProjections(std::move(copied));
+    return new_storage;
 }
 
 MutableDataPartStoragePtr DataPartStorageOnDiskBase::clonePart(
@@ -735,7 +672,7 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::clonePart(
         std::vector<String> stale_siblings;
         if (dst_disk->existsDirectory(dest_root))
             for (auto it = dst_disk->iterateDirectory(dest_root); it->isValid(); it->next())
-                if (it->name().starts_with(sibling_prefix) && (it->name().ends_with(".proj") || it->name().ends_with(".tmp_proj")))
+                if (it->name().starts_with(sibling_prefix) && projectionDirNameType(it->name()) != ProjectionDirNameType::None)
                     stale_siblings.push_back(fs::path(dest_root) / it->name());
 
         for (const auto & stale : stale_siblings)
@@ -787,7 +724,15 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::clonePart(
     }
 
     auto single_disk_volume = std::make_shared<SingleDiskVolume>(dst_disk->getName(), dst_disk, 0);
-    return create(single_disk_volume, to, dir_path, /*initialize=*/ true);
+    auto new_storage = create(single_disk_volume, to, dir_path, /*initialize=*/ true);
+
+    /// The copy owns exactly what the source owned (temps are transient state and not copied).
+    ProjectionEntries copied;
+    for (const auto & [name, entry] : getProjections())
+        if (!entry.is_temp)
+            copied.emplace(name, entry);
+    new_storage->setProjections(std::move(copied));
+    return new_storage;
 }
 
 void DataPartStorageOnDiskBase::rename(
@@ -851,7 +796,7 @@ void DataPartStorageOnDiskBase::rename(
     std::vector<String> stale_siblings;
     if (volume->getDisk()->existsDirectory(new_root_path))
         for (auto it = volume->getDisk()->iterateDirectory(new_root_path); it->isValid(); it->next())
-            if (it->name().starts_with(dest_prefix) && (it->name().ends_with(".proj") || it->name().ends_with(".tmp_proj")))
+            if (it->name().starts_with(dest_prefix) && projectionDirNameType(it->name()) != ProjectionDirNameType::None)
                 stale_siblings.push_back(it->name());
 
     for (const auto & entry : stale_siblings)
@@ -907,28 +852,6 @@ void DataPartStorageOnDiskBase::rename(
     }
 }
 
-namespace
-{
-
-/// Classifies a directory basename as a projection dir. Returns false for anything else; sets
-/// is_temp for an in-progress ".tmp_proj" dir.
-bool matchesProjectionSuffix(const std::string & name, bool & is_temp)
-{
-    if (endsWith(name, ".tmp_proj"))
-    {
-        is_temp = true;
-        return true;
-    }
-    if (endsWith(name, ".proj"))
-    {
-        is_temp = false;
-        return true;
-    }
-    return false;
-}
-
-}
-
 std::pair<std::string, std::string> DataPartStorageOnDiskBase::getProjectionStorageRootAndDir(
     const std::string & name, ProjectionStorageFormat format) const
 {
@@ -954,9 +877,8 @@ IDataPartStorage::ProjectionEntries DataPartStorageOnDiskBase::detectProjections
     {
         for (auto it = disk->iterateDirectory(nested_root); it->isValid(); it->next())
         {
-            bool is_temp = false;
-            if (matchesProjectionSuffix(it->name(), is_temp))
-                entries.emplace(it->name(), ProjectionEntry{ProjectionStorageFormat::LEGACY_NESTED, is_temp});
+            if (auto type = projectionDirNameType(it->name()); type != ProjectionDirNameType::None)
+                entries.emplace(it->name(), ProjectionEntry{ProjectionStorageFormat::LEGACY_NESTED, type == ProjectionDirNameType::Temp});
         }
     }
 
@@ -971,9 +893,8 @@ IDataPartStorage::ProjectionEntries DataPartStorageOnDiskBase::detectProjections
             if (!startsWith(it->name(), flat_prefix))
                 continue;
             const std::string stripped = it->name().substr(flat_prefix.size());
-            bool is_temp = false;
-            if (matchesProjectionSuffix(stripped, is_temp) && !entries.contains(stripped))
-                entries.emplace(stripped, ProjectionEntry{ProjectionStorageFormat::FLAT, is_temp});
+            if (auto type = projectionDirNameType(stripped); type != ProjectionDirNameType::None && !entries.contains(stripped))
+                entries.emplace(stripped, ProjectionEntry{ProjectionStorageFormat::FLAT, type == ProjectionDirNameType::Temp});
         }
     }
 
@@ -984,24 +905,82 @@ IDataPartStorage::ProjectionEntries DataPartStorageOnDiskBase::getProjections() 
 {
     std::lock_guard lock(projection_entries_mutex);
     if (!projection_entries_ready)
-    {
-        projection_entries = detectProjections();
-        projection_entries_ready = true;
-    }
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Projections were never set for part storage {}", fs::path(root_path) / part_dir);
     return projection_entries;
 }
 
-void DataPartStorageOnDiskBase::addProjectionEntry(const std::string & name, ProjectionEntry entry)
+void DataPartStorageOnDiskBase::setProjections(ProjectionEntries entries)
 {
     std::lock_guard lock(projection_entries_mutex);
-    projection_entries[name] = entry;
+    projection_entries = std::move(entries);
     projection_entries_ready = true;
 }
 
-void DataPartStorageOnDiskBase::setProjectionsReady()
+void DataPartStorageOnDiskBase::addProjection(const std::string & name, ProjectionEntry entry)
 {
     std::lock_guard lock(projection_entries_mutex);
-    projection_entries_ready = true;
+    if (!projection_entries_ready)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot register projection {} in part {}: projections were never set", name, part_dir);
+    projection_entries[name] = entry;
+}
+
+void DataPartStorageOnDiskBase::dropProjection(const std::string & name)
+{
+    std::lock_guard lock(projection_entries_mutex);
+    projection_entries.erase(name);
+}
+
+void DataPartStorageOnDiskBase::removeTempProjection(const std::string & name)
+{
+    const auto entries = getProjections();
+    auto it = entries.find(name);
+    if (it == entries.end())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown projection {} in part {}", name, getRelativePath());
+    if (!it->second.is_temp)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Projection {} in part {} is not temporary; it is removed only with its parent part", name, getRelativePath());
+
+    const auto [proj_root, proj_dir] = getProjectionStorageRootAndDir(name, it->second.format);
+    /// Temporary projections are transient by-products of materialization, their blobs are never shared.
+    executeWriteOperation([&](auto & disk) { disk.removeSharedRecursive(fs::path(proj_root) / proj_dir / "", false, {}); });
+    dropProjection(name);
+}
+
+void DataPartStorageOnDiskBase::renameProjection(const std::string & old_name, const std::string & new_name)
+{
+    const auto entries = getProjections();
+    auto it = entries.find(old_name);
+    if (it == entries.end())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown projection {} in part {}", old_name, getRelativePath());
+
+    const auto format = it->second.format;
+    const auto [from_root, from_dir] = getProjectionStorageRootAndDir(old_name, format);
+    const auto [to_root, to_dir] = getProjectionStorageRootAndDir(new_name, format);
+
+    /// An existing destination is residue of a failed operation on a same-named part (tmp part names repeat).
+    if (volume->getDisk()->existsDirectory(fs::path(to_root) / to_dir))
+    {
+        LOG_WARNING(getLogger("DataPartStorageOnDiskBase"), "Removing stale projection directory {} before renaming projection {} to {}",
+            fullPath(volume->getDisk(), fs::path(to_root) / to_dir), old_name, new_name);
+        /// Do not remove blobs if they exist
+        volume->getDisk()->removeSharedRecursive(fs::path(to_root) / to_dir / "", true, {});
+    }
+
+    executeWriteOperation([&](auto & disk) { disk.moveDirectory(fs::path(from_root) / from_dir, fs::path(to_root) / to_dir); });
+    dropProjection(old_name);
+    addProjection(new_name, {format, projectionDirNameType(new_name) == ProjectionDirNameType::Temp});
+}
+
+void DataPartStorageOnDiskBase::syncProjectionStoragePath(const std::string & name, IDataPartStorage & projection_storage) const
+{
+    const auto entries = getProjections();
+    auto it = entries.find(name);
+    if (it == entries.end())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown projection {} in part {}", name, getRelativePath());
+
+    const auto [proj_root, proj_dir] = getProjectionStorageRootAndDir(name, it->second.format);
+    auto & projection_storage_on_disk = assert_cast<DataPartStorageOnDiskBase &>(projection_storage);
+    projection_storage_on_disk.root_path = proj_root;
+    projection_storage_on_disk.part_dir = proj_dir;
 }
 
 void DataPartStorageOnDiskBase::remove(

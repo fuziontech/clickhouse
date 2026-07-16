@@ -994,9 +994,9 @@ public:
     size_t clearOldTemporaryDirectories(size_t custom_directories_lifetime_seconds, const NameSet & valid_prefixes = {"tmp_", "tmp-fetch_"});
     size_t clearOldTemporaryDirectories(const String & root_path, size_t custom_directories_lifetime_seconds, const NameSet & valid_prefixes);
 
-    /// Removes FLAT projection sibling dirs whose owner part directory does not exist (residue of
-    /// interrupted multi-directory operations). Safe only while no renames are in flight (startup).
-    size_t clearOrphanProjectionSiblings();
+    /// Removes FLAT projection siblings whose owner part dir does not exist. `max_age_seconds` guards
+    /// the rename commit window (a sibling is briefly ownerless); startup passes 0 (no renames in flight).
+    size_t clearOrphanProjectionSiblings(size_t max_age_seconds);
 
     /// Removes FLAT projection siblings of a removed detached part. `keep_shared` must be the value
     /// removeDetachedPart returned for the owner: its zero-copy lock covers the projection blobs too.

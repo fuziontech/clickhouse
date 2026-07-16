@@ -1058,6 +1058,9 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeProjectionPartImpl(
     MergeTreeData::reserveSpace(expected_size, parent_part->getDataPartStorage());
     part_type = data.choosePartFormat(expected_size, block.rows(), parent_part->info.level, &projection).part_type;
 
+    /// Register the new projection dir in the parent's owned set (sweeping any stale leftover).
+    parent_part->getDataPartStorage().createProjection(part_name + (is_temp ? ".tmp_proj" : ".proj"));
+
     auto new_data_part = parent_part->getProjectionPartBuilder(part_name, &projection, is_temp).withPartType(part_type).build();
     auto projection_part_storage = new_data_part->getDataPartStoragePtr();
     auto data_settings = data.getSettings(&projection.settings_changes);

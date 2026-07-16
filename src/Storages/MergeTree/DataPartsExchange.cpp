@@ -820,6 +820,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
         auto s = std::make_shared<DataPartStorageOnDiskFull>(v, part_relative_path, part_dir);
         /// Fetched projection dirs don't exist yet; create them in this replica's configured layout.
         s->setProjectionStorageFormat(data.getProjectionStorageFormat());
+        s->setProjections({});
         return std::pair{std::move(v), std::move(s)};
     }();
 
@@ -864,8 +865,8 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
 
             MergeTreeData::DataPart::Checksums projection_checksum;
 
+            part_storage_for_loading->createProjection(projection_name + ".proj");
             auto projection_part_storage = part_storage_for_loading->getProjection(projection_name + ".proj", true);
-            projection_part_storage->createDirectories();
 
             downloadBaseOrProjectionPartToDisk(
                 replica_path, projection_part_storage, in, output_buffer_getter, projection_checksum, throttler, sync);

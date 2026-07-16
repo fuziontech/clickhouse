@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <string_view>
 
 #include <boost/core/noncopyable.hpp>
 #include <Poco/Timestamp.h>
@@ -91,9 +92,27 @@ struct HardlinkedFiles
     NameSet hardlinks_from_source_part;
 };
 
+/// Naming vocabulary for projection directories; the only code that spells out "<owner>.<name>.proj".
+/// Every scanner (detectProjections, orphan GC, unfreeze, detached listing) must classify names through it.
+enum class ProjectionDirNameType : uint8_t
+{
+    None,
+    Normal,
+    Temp,
+};
+
+/// Classifies a directory basename: "*.proj" -> Normal, "*.tmp_proj" -> Temp, else None.
+ProjectionDirNameType projectionDirNameType(std::string_view dir_name);
+
+/// "<owner>.<name>.proj" -> "<owner>" (part dir names contain no dots); "" if not a sibling name.
+String projectionSiblingOwner(std::string_view dir_name);
+
 /// This is an abstraction of storage for data part files.
 /// Ideally, it is assumed to contain read-only methods from IDisk.
 /// It is not fulfilled now, but let's try our best.
+///
+/// Commit-last invariant for FLAT projection siblings: materializing writes projections first and
+/// the main part dir last (its presence marks completeness); dismantling removes it first.
 class IDataPartStorage : public boost::noncopyable
 {
 public:
@@ -131,21 +150,16 @@ public:
     /// same string passed to getProjection/hasProjection, so call sites need no translation.
     using ProjectionEntries = std::map<String, ProjectionEntry, std::less<>>;
 
-    /// Projections this storage knows it has: the owned set when seeded by the part at load (residue of an
-    /// unrelated same-named part excluded), else a one-time disk scan. Authoritative after; returned by value.
+    /// The owned projection set, seeded by the logical layer and kept true by the dir-mutating verbs.
+    /// Throws LOGICAL_ERROR if never seeded: a disk scan could adopt residue of a same-named part.
     virtual ProjectionEntries getProjections() const = 0;
 
-    /// Raw scan of the on-disk projection dirs across both layouts, residue included. Does not touch
-    /// the cache. For manifest-less paths only (checksums reconstruction, part consistency checks).
+    /// Raw scan of the on-disk projection dirs across both layouts, residue included; does not touch
+    /// the owned set. For disk-truth paths only (checksums reconstruction, part consistency checks).
     virtual ProjectionEntries detectProjections() const = 0;
 
-    /// Register a projection this part owns and mark the cache authoritative. Used to seed from the
-    /// manifest at load, and by getProjection/createProjection when a new projection dir is created.
-    virtual void addProjectionEntry(const std::string & name, ProjectionEntry entry) = 0;
-
-    /// Mark the projection cache authoritative even when empty, so getProjections() will not fall
-    /// back to a disk scan. Called at the end of the part's projection seeding.
-    virtual void setProjectionsReady() = 0;
+    /// Atomically replace the owned set; an empty map is a valid set.
+    virtual void setProjections(ProjectionEntries entries) = 0;
 
     /// Checks whether part has projection
     virtual bool hasProjection(const std::string & name) const = 0;
@@ -286,8 +300,8 @@ public:
     /// Create a backup of a data part.
     /// This method adds a new entry to backup_entries.
     /// Also creates a new tmp_dir for internal disk (if disk is mentioned the first time).
-    /// A projection storage backs up under its logical name ("<name>.proj") regardless of the
-    /// on-disk projection layout, so the backup layout is layout-independent (see getProjection).
+    /// `path_in_backup` is the full destination dir of THIS storage; the caller names it (a projection
+    /// goes under its logical "<name>.proj"), so the backup layout is independent of the on-disk layout.
     using TemporaryFilesOnDisks = std::map<DiskPtr, std::shared_ptr<TemporaryFileOnDisk>>;
     virtual void backup(
         const MergeTreeDataPartChecksums & checksums,
@@ -322,22 +336,16 @@ public:
         std::optional<int32_t> metadata_version_to_write = std::nullopt;
     };
 
+    /// Materializes a copy of the part at 'to/dir_path' (FLAT projection siblings first, main dir last).
+    /// `dst_disk` == nullptr means the part's own disk; a different disk cannot hardlink, so it always copies.
     virtual std::shared_ptr<IDataPartStorage> freeze(
         const std::string & to,
         const std::string & dir_path,
+        const DiskPtr & dst_disk,
         const ReadSettings & read_settings,
         const WriteSettings & write_settings,
         std::function<void(const DiskPtr &)> save_metadata_callback,
         const ClonePartParams & params) const = 0;
-
-    virtual std::shared_ptr<IDataPartStorage> freezeRemote(
-    const std::string & to,
-    const std::string & dir_path,
-    const DiskPtr & dst_disk,
-    const ReadSettings & read_settings,
-    const WriteSettings & write_settings,
-    std::function<void(const DiskPtr &)> save_metadata_callback,
-    const ClonePartParams & params) const = 0;
 
     /// Make a full copy of a data part into 'to/dir_path' (possibly to a different disk).
     virtual std::shared_ptr<IDataPartStorage> clonePart(
@@ -355,8 +363,24 @@ public:
     virtual void changeRootPath(const std::string & from_root, const std::string & to_root) = 0;
 
     virtual void createDirectories() = 0;
-    /// Creates the on-disk directory for a projection sub-part
+
+    /// The only three operations that mutate projection directories; each keeps the owned set true.
+
+    /// Creates the on-disk directory for a projection sub-part and records it in the owned set.
+    /// Sweeps a stale leftover directory at the target first (tmp part names repeat across attempts).
     virtual void createProjection(const std::string & name) = 0;
+
+    /// Removes a temporary projection directory and drops it from the owned set. A non-temporary
+    /// projection is removed only together with its parent part.
+    virtual void removeTempProjection(const std::string & name) = 0;
+
+    /// Renames a projection dir within this part (e.g. "p_1.tmp_proj" -> "p.proj"); the layout
+    /// comes from the existing entry.
+    virtual void renameProjection(const std::string & old_name, const std::string & new_name) = 0;
+
+    /// Repoints a projection sub-part's storage at where this part's owned set says the projection
+    /// lives now (used after the part or the projection dir was renamed).
+    virtual void syncProjectionStoragePath(const std::string & name, IDataPartStorage & projection_storage) const = 0;
 
     virtual std::unique_ptr<WriteBufferFromFileBase> writeFile(
         const String & name,
