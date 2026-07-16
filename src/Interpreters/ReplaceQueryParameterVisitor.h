@@ -11,6 +11,7 @@ class ASTQueryParameter;
 class ASTSetQuery;
 class Field;
 class SettingsChanges;
+class ASTRolesOrUsersSet;
 
 /// Visit substitutions in a query, replace ASTQueryParameter with ASTLiteral.
 /// Rebuild ASTIdentifiers if some parts are ASTQueryParameter.
@@ -37,6 +38,8 @@ private:
     const String & getParamValue(const String & name);
     void resolveParameterizedAlias(ASTPtr & ast);
     void visitIdentifier(ASTPtr & ast);
+    void visitIgnoredIdentifierParameter(const String & name);
+    void visitIgnoredRolesOrUsersSet(const ASTRolesOrUsersSet * roles_or_users);
     void visitQueryParameter(ASTPtr & ast);
     void visitSetQuery(ASTSetQuery & set_query);
     void visitChildren(ASTPtr & ast);

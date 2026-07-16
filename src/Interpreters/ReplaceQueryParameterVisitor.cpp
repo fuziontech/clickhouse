@@ -14,9 +14,10 @@
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTSetQuery.h>
 #include <Parsers/ASTViewTargets.h>
-#include <Parsers/FieldFromAST.h>
 #include <Parsers/Access/ASTCreateUserQuery.h>
-#include <Parsers/Access/ASTUserNameWithHost.h>
+#include <Parsers/Access/ASTGrantQuery.h>
+#include <Parsers/Access/ASTRolesOrUsersSet.h>
+#include <Parsers/FieldFromAST.h>
 #include <Parsers/TablePropertiesQueriesASTs.h>
 #include <Analyzer/Utils.h>
 #include <Common/SettingsChanges.h>
@@ -50,19 +51,29 @@ void ReplaceQueryParameterVisitor::visit(ASTPtr & ast)
         visitIdentifier(ast);
     else if (auto * set_query = ast->as<ASTSetQuery>())
         visitSetQuery(*set_query);
+    else if (auto * grant_query = ast->as<ASTGrantQuery>())
+    {
+        visitIgnoredRolesOrUsersSet(grant_query->roles.get());
+        visitIgnoredRolesOrUsersSet(grant_query->grantees.get());
+        visitChildren(ast);
+    }
+    else if (auto * create_user_query = ast->as<ASTCreateUserQuery>())
+    {
+        visitIgnoredRolesOrUsersSet(create_user_query->roles.get());
+        visitIgnoredRolesOrUsersSet(create_user_query->default_roles.get());
+        visitIgnoredRolesOrUsersSet(create_user_query->grantees.get());
+        visitChildren(ast);
+    }
+    else if (auto * roles_or_users = ast->as<ASTRolesOrUsersSet>())
+    {
+        for (const auto & name : roles_or_users->ignored_query_parameter_names)
+            visitIgnoredIdentifierParameter(name);
+        visitChildren(ast);
+    }
     else
     {
         if (auto * describe_query = dynamic_cast<ASTDescribeQuery *>(ast.get()); describe_query && describe_query->table_expression)
             visitChildren(describe_query->table_expression);
-        else if (auto * create_user_query = dynamic_cast<ASTCreateUserQuery *>(ast.get()))
-        {
-            if (create_user_query->names)
-            {
-                ASTPtr names = create_user_query->names;
-                visitChildren(names);
-            }
-            visitChildren(ast);
-        }
         else if (auto * create_query = dynamic_cast<ASTCreateQuery *>(ast.get()))
         {
             if (create_query->isParameterizedView())
@@ -297,6 +308,21 @@ void ReplaceQueryParameterVisitor::visitIdentifier(ASTPtr & ast)
 
     ast_identifier->resetFullName();
     ast_identifier->children.clear();
+}
+
+void ReplaceQueryParameterVisitor::visitIgnoredIdentifierParameter(const String & name)
+{
+    if (getParamValue(name).empty())
+        throw Exception(ErrorCodes::BAD_QUERY_PARAMETER, "Empty Identifier part after parameter {} substitution", backQuote(name));
+}
+
+void ReplaceQueryParameterVisitor::visitIgnoredRolesOrUsersSet(const ASTRolesOrUsersSet * roles_or_users)
+{
+    if (!roles_or_users || roles_or_users->hasQueryParameters())
+        return;
+
+    for (const auto & name : roles_or_users->ignored_query_parameter_names)
+        visitIgnoredIdentifierParameter(name);
 }
 
 void ReplaceQueryParameterVisitor::resolveParameterizedAlias(ASTPtr & ast)

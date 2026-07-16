@@ -189,19 +189,35 @@ ASTPtr ASTCreateUserQuery::clone() const
     res->authentication_methods.clear();
 
     if (names)
+    {
         res->names = boost::static_pointer_cast<ASTUserNamesWithHost>(names->clone());
+        if (res->names->hasQueryParameters())
+            res->children.push_back(res->names);
+    }
 
     if (roles)
+    {
         res->roles = boost::static_pointer_cast<ASTRolesOrUsersSet>(roles->clone());
+        if (res->roles->hasQueryParameters())
+            res->children.push_back(res->roles);
+    }
 
     if (default_roles)
+    {
         res->default_roles = boost::static_pointer_cast<ASTRolesOrUsersSet>(default_roles->clone());
+        if (res->default_roles->hasQueryParameters())
+            res->children.push_back(res->default_roles);
+    }
 
     if (default_database)
         res->default_database = boost::static_pointer_cast<ASTDatabaseOrNone>(default_database->clone());
 
     if (grantees)
+    {
         res->grantees = boost::static_pointer_cast<ASTRolesOrUsersSet>(grantees->clone());
+        if (res->grantees->hasQueryParameters())
+            res->children.push_back(res->grantees);
+    }
 
     if (settings)
         res->settings = boost::static_pointer_cast<ASTSettingsProfileElements>(settings->clone());

@@ -95,6 +95,7 @@
 #include <Parsers/Access/ASTCreateSettingsProfileQuery.h>
 #include <Parsers/Access/ASTCreateUserQuery.h>
 #include <Parsers/Access/ASTDropAccessEntityQuery.h>
+#include <Parsers/Access/ASTExecuteAsQuery.h>
 #include <Parsers/Access/ASTGrantQuery.h>
 #include <Parsers/Access/ASTRolesOrUsersSet.h>
 #include <Parsers/Access/ASTSetRoleQuery.h>
@@ -7288,6 +7289,9 @@ void QueryFuzzer::fuzz(ASTPtr & ast)
             /// ones that do not match the final verb so the statement stays reparseable both ways.
             if (create_user->alter)
             {
+                create_user->children.erase(
+                    std::remove(create_user->children.begin(), create_user->children.end(), create_user->roles),
+                    create_user->children.end());
                 create_user->roles.reset();
                 create_user->settings.reset();
             }
@@ -7464,6 +7468,19 @@ void QueryFuzzer::fuzz(ASTPtr & ast)
             fuzz(check_table->children);
         }
     }
+    else if (auto * execute_as = typeid_cast<ASTExecuteAsQuery *>(ast.get()))
+    {
+        /// Some nested query types are replaced while fuzzing. Keep the raw subquery pointer in sync
+        /// with its owning child slot.
+        const auto * subquery = execute_as->subquery;
+        for (auto & child : execute_as->children)
+        {
+            const bool is_subquery = child.get() == subquery;
+            fuzz(child);
+            if (is_subquery)
+                execute_as->subquery = child.get();
+        }
+    }
     else
     {
         fuzz(ast->children);
@@ -7633,7 +7650,7 @@ void QueryFuzzer::collectFuzzInfoRecurse(ASTPtr ast)
     {
         addColumnLike(ast);
     }
-    else if (typeid_cast<ASTIdentifier *>(ast.get()))
+    else if (const auto * identifier = typeid_cast<ASTIdentifier *>(ast.get()); identifier && !identifier->isParam())
     {
         addColumnLike(ast);
     }

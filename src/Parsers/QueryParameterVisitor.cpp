@@ -1,6 +1,10 @@
 #include <Parsers/QueryParameterVisitor.h>
 #include <Parsers/ASTQueryParameter.h>
 #include <Parsers/ASTSetQuery.h>
+#include <Parsers/ASTWithAlias.h>
+#include <Parsers/Access/ASTCreateUserQuery.h>
+#include <Parsers/Access/ASTGrantQuery.h>
+#include <Parsers/Access/ASTRolesOrUsersSet.h>
 #include <Parsers/FieldFromAST.h>
 #include <Parsers/ParserQuery.h>
 #include <Parsers/parseQuery.h>
@@ -27,6 +31,35 @@ public:
             visitSetQuery(*set_query);
         else
         {
+            /// A parametrized alias (`expr AS {name:Identifier}`) is stored as a member
+            /// rather than as a child and must be discovered here explicitly.
+            if (const auto * with_alias = dynamic_cast<const ASTWithAlias *>(ast.get()); with_alias && with_alias->parametrised_alias)
+                visitQueryParameter(*with_alias->parametrised_alias);
+
+            auto visit_ignored_roles_or_users = [&](const ASTRolesOrUsersSet * roles_or_users)
+            {
+                if (!roles_or_users || roles_or_users->hasQueryParameters())
+                    return;
+
+                for (const auto & name : roles_or_users->ignored_query_parameter_names)
+                    query_parameters[name] = "Identifier";
+            };
+
+            if (const auto * grant_query = ast->as<ASTGrantQuery>())
+            {
+                visit_ignored_roles_or_users(grant_query->roles.get());
+                visit_ignored_roles_or_users(grant_query->grantees.get());
+            }
+            else if (const auto * create_user_query = ast->as<ASTCreateUserQuery>())
+            {
+                visit_ignored_roles_or_users(create_user_query->roles.get());
+                visit_ignored_roles_or_users(create_user_query->default_roles.get());
+                visit_ignored_roles_or_users(create_user_query->grantees.get());
+            }
+            else if (const auto * roles_or_users = ast->as<ASTRolesOrUsersSet>())
+                for (const auto & name : roles_or_users->ignored_query_parameter_names)
+                    query_parameters[name] = "Identifier";
+
             for (const auto & child : ast->children)
                 visit(child);
         }
