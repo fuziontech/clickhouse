@@ -879,8 +879,10 @@ void DataPartStorageOnDiskBase::rename(
         if (fsync_part_dir)
         {
             to_sync_guard = volume->getDisk()->getDirectorySyncGuard(to);
-            /// The rename entries themselves live in the root, not in `to`.
-            root_sync_guard = volume->getDisk()->getDirectorySyncGuard(new_root_path);
+            /// The sibling rename entries live in the root, not in `to`. Sibling-less renames keep
+            /// the historical single sync on `to` (02361_fsync_profile_events pins the event count).
+            if (!flat_projection_moves.empty())
+                root_sync_guard = volume->getDisk()->getDirectorySyncGuard(new_root_path);
         }
     });
 

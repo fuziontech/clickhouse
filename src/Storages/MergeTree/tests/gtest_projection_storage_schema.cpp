@@ -162,6 +162,15 @@ TEST(ProjectionStorageSchema, RenameFsyncsSiblingNamespace)
     fixture.disk->sync_guard_paths.clear();
     fixture.storage->rename("", "all_1_1_2", nullptr, false, /*fsync_part_dir=*/ false);
     EXPECT_TRUE(fixture.disk->sync_guard_paths.empty());
+
+    /// A sibling-less rename keeps the historical single sync on the moved dir
+    /// (02361_fsync_profile_events pins the event count).
+    PartStorageFixture plain;
+    plain.storage->setProjectionStorageFormat(IDataPartStorage::ProjectionStorageFormat::FLAT);
+    plain.storage->setProjections({});
+    plain.disk->sync_guard_paths.clear();
+    plain.storage->rename("", "all_2_2_0", nullptr, false, /*fsync_part_dir=*/ true);
+    EXPECT_EQ(plain.disk->sync_guard_paths, (Strings{"all_2_2_0"}));
 }
 
 TEST(ProjectionStorageSchema, RenameProjectionFsyncsEnclosingDir)
