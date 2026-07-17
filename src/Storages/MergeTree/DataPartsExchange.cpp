@@ -820,6 +820,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
         auto s = std::make_shared<DataPartStorageOnDiskFull>(v, part_relative_path, part_dir);
         /// Fetched projection dirs don't exist yet; create them in this replica's configured layout.
         s->setProjectionStorageFormat(data.getProjectionStorageFormat());
+        s->setZeroCopyReplicationEnabled((*data_settings)[MergeTreeSetting::allow_remote_fs_zero_copy_replication]);
         s->setProjections({});
         return std::pair{std::move(v), std::move(s)};
     }();

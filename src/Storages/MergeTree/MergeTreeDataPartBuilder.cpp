@@ -17,6 +17,11 @@ namespace ErrorCodes
     extern const int UNKNOWN_PART_TYPE;
 }
 
+namespace MergeTreeSetting
+{
+    extern const MergeTreeSettingsBool allow_remote_fs_zero_copy_replication;
+}
+
 MergeTreeDataPartBuilder::MergeTreeDataPartBuilder(
     const MergeTreeData & data_, String name_, VolumePtr volume_, String root_path_, String part_dir_, const ReadSettings & read_settings_)
     : data(data_)
@@ -59,6 +64,8 @@ std::shared_ptr<IMergeTreeDataPart> MergeTreeDataPartBuilder::build()
 
     if (part_storage->getProjectionStorageFormat() == IDataPartStorage::ProjectionStorageFormat::NONE)
         part_storage->setProjectionStorageFormat(data.getProjectionStorageFormat());
+
+    part_storage->setZeroCopyReplicationEnabled((*data.getSettings())[MergeTreeSetting::allow_remote_fs_zero_copy_replication]);
 
     if (parent_part && data.format_version == MERGE_TREE_DATA_OLD_FORMAT_VERSION)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot create projection part in MergeTree table created in old syntax");
@@ -105,8 +112,8 @@ MutableDataPartStoragePtr MergeTreeDataPartBuilder::getPartStorageByType(
         case Type::Full:
         {
             auto storage = std::make_shared<DataPartStorageOnDiskFull>(volume_, root_path_, part_dir_);
-            /// Seed empty: a fresh part registers projections via createProjection, a loaded part
-            /// re-seeds in loadProjections; a disk scan here could adopt residue of a same-named part.
+            /// Seed empty: a fresh part registers projections via createProjection, a loaded part re-seeds in loadProjections; a disk scan
+            /// here could adopt residue of a same-named part.
             storage->setProjections({});
             return storage;
         }

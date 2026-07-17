@@ -466,8 +466,8 @@ public:
     /// Moves a part to detached/ directory and adds prefix to its name
     void renameToDetached(const String & prefix, bool ignore_error = false);
 
-    /// Re-seed the owned projection set from disk before detaching a part that broke before
-    /// loadProjections ran; otherwise its FLAT siblings are stranded for the orphan GC.
+    /// Re-seed the owned projection set from disk before detaching a part that broke before loadProjections ran; otherwise its FLAT
+    /// siblings are stranded for the orphan GC.
     void adoptOnDiskProjectionsForDetach();
 
     /// Makes checks and move part to new directory

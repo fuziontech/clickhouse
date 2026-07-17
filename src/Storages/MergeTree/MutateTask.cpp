@@ -2250,8 +2250,8 @@ private:
             }
         }
 
-        /// Hardlink unchanged projections. getProjections() is the owned set (layout-independent),
-        /// so residue siblings of an unrelated same-named part are not carried into the new part.
+        /// Hardlink unchanged projections. getProjections() is the owned set (layout-independent), so residue siblings of an unrelated
+        /// same-named part are not carried into the new part.
         for (const auto & [projection_dir, projection] : ctx->source_part->getDataPartStorage().getProjections())
         {
             if (projection.is_temp || !entries_to_hardlink.contains(projection_dir))
@@ -2267,8 +2267,7 @@ private:
                 projection_data_part_storage_dst->createHardLinkFrom(
                     *projection_data_part_storage_src, p_it->name(), p_it->name());
 
-                /// The zero-copy keep-list uses the logical projection dir name
-                /// regardless of the on-disk projection layout.
+                /// The zero-copy keep-list uses the logical projection dir name regardless of the on-disk projection layout.
                 hardlinked_files.insert(fs::path(projection_dir) / p_it->name());
             }
         }
@@ -2552,8 +2551,8 @@ private:
             }
         }
 
-        /// Hardlink unchanged projections from the owned set. No checksums.has() filter here:
-        /// legacy parts own metadata-declared projections that checksums.txt does not reference.
+        /// Hardlink unchanged projections from the owned set. No checksums.has() filter here: legacy parts own metadata-declared
+        /// projections that checksums.txt does not reference.
         for (const auto & [projection_dir, projection] : ctx->source_part->getDataPartStorage().getProjections())
         {
             if (projection.is_temp || ctx->files_to_skip.contains(projection_dir))
@@ -2583,8 +2582,7 @@ private:
                     projection_data_part_storage_dst->createHardLinkFrom(
                         *projection_data_part_storage_src, p_it->name(), p_it->name());
 
-                    /// The zero-copy keep-list uses the logical projection dir name
-                    /// regardless of the on-disk projection layout.
+                    /// The zero-copy keep-list uses the logical projection dir name regardless of the on-disk projection layout.
                     hardlinked_files.insert(fs::path(projection_dir) / p_it->name());
                 }
             }

@@ -1217,6 +1217,71 @@ def test_orphan_gc_removes_blobs_without_zero_copy():
     node.query("DROP TABLE t_leak SYNC")
 
 
+# Finding: the publish-time destination sweep (rename()) deleted residue metadata but always kept
+# remote blobs; without zero-copy nothing references them afterwards - a permanent S3 leak.
+def test_publish_sweep_removes_blobs_without_zero_copy():
+    node.query("DROP TABLE IF EXISTS t_sweep SYNC")
+    node.query("DROP TABLE IF EXISTS t_sweep_donor SYNC")
+    node.query("SYSTEM STOP MERGES")
+    # the donor provides a real, unshared, blob-backed projection dir to plant as residue
+    node.query(
+        """CREATE TABLE t_sweep_donor (key UInt64, id UInt64, value String,
+           PROJECTION p (SELECT key, id ORDER BY id))
+           ENGINE = MergeTree ORDER BY key
+           SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat',
+               storage_policy = 's3'"""
+    )
+    node.query(
+        """CREATE TABLE t_sweep (key UInt64, id UInt64, value String,
+           PROJECTION p (SELECT key, id ORDER BY id))
+           ENGINE = MergeTree ORDER BY key
+           SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat',
+               storage_policy = 's3', materialize_projections_on_insert = 0"""
+    )
+    node.query(
+        "INSERT INTO t_sweep_donor SELECT number, number * 2, toString(number) FROM numbers(1000)"
+    )
+    donor_sib = f"{part_dir('t_sweep_donor')}.p.proj"
+    donor_uuid = node.query(
+        "SELECT uuid FROM system.tables WHERE name = 't_sweep_donor'"
+    ).strip()
+    donor_part = part_name("t_sweep_donor")
+    sibling_keys = set(
+        node.query(
+            f"""SELECT remote_path FROM system.remote_data_paths
+                WHERE local_path LIKE '%/{donor_uuid}/{donor_part}.p.proj/%'"""
+        ).split()
+    )
+    assert sibling_keys
+
+    def minio_keys():
+        return {
+            o.object_name
+            for o in cluster.minio_client.list_objects(
+                cluster.minio_bucket, "data/", recursive=True
+            )
+        }
+
+    assert sibling_keys <= minio_keys()  # sanity: key format matches the listing
+    # plant the donor's sibling (real metadata, sane refcounts, unshared blobs) as residue at
+    # t_sweep's future part name; the donor table is sacrificed. mv, not cp: a metadata copy
+    # would lie about blob refcounts.
+    residue = f"{table_path('t_sweep')}/all_1_1_0.p.proj"
+    node.exec_in_container(
+        ["bash", "-c", f"mv {donor_sib} {residue}"], privileged=True, user="root"
+    )
+    # the first insert publishes all_1_1_0; the destination sweep must remove the residue with its blobs
+    node.query("INSERT INTO t_sweep SELECT number, number, '' FROM numbers(100)")
+    p = part_dir("t_sweep")
+    assert p.endswith("all_1_1_0")  # the name collision really happened
+    assert not path_exists(residue)
+    leaked = sibling_keys & minio_keys()
+    assert leaked == set()
+    assert node.query("SELECT count() FROM t_sweep").strip() == "100"
+    node.query("DROP TABLE t_sweep SYNC")
+    node.query("DROP TABLE t_sweep_donor SYNC")
+
+
 # --- Crash-window recovery coverage (planted states, both rename directions) ---
 
 

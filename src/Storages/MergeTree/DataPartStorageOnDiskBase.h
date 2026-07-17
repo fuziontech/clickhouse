@@ -39,7 +39,10 @@ public:
     void removeProjection(const Projection & projection) override;
     Projection renameProjection(const Projection & projection, const std::string & new_dir_name) override;
     void syncProjectionStoragePath(const Projection & projection, IDataPartStorage & projection_storage) const override;
-    void removeProjectionResidue(const Projection & placement, bool can_remove_shared_blobs) override;
+    void removeProjectionResidue(const Projection & placement) override;
+
+    bool isZeroCopyReplicationEnabled() const override { return zero_copy_replication_enabled; }
+    void setZeroCopyReplicationEnabled(bool value) override { zero_copy_replication_enabled = value; }
 
     ProjectionStorageFormat getProjectionStorageFormat() const override { return projection_storage_format; }
     void setProjectionStorageFormat(ProjectionStorageFormat format) override
@@ -211,8 +214,7 @@ protected:
         std::string part_dir_,
         bool initialize_) const = 0;
 
-    /// Incremental owned-set updates for createProjection/renameProjection/removeProjection;
-    /// require an already-seeded set.
+    /// Incremental owned-set updates for createProjection/renameProjection/removeProjection; require an already-seeded set.
     void addProjection(Projection projection_);
     void dropProjection(const std::string & dir_name);
 
@@ -273,8 +275,11 @@ protected:
     /// Layout for projection directories created through this storage.
     ProjectionStorageFormat projection_storage_format = ProjectionStorageFormat::NONE;
 
-    /// The owned projection set. ready=false: never seeded (reads throw); ready=true: authoritative
-    /// (absent key = no projection). Paths are derived, so only setRelativePath drops it.
+    /// See isZeroCopyReplicationEnabled; default true keeps residue blobs (fail-safe until seeded).
+    bool zero_copy_replication_enabled = true;
+
+    /// The owned projection set. ready=false: never seeded (reads throw); ready=true: authoritative (absent key = no projection). Paths are
+    /// derived, so only setRelativePath drops it.
     mutable std::mutex projections_mutex;
     mutable bool owned_projections_ready TSA_GUARDED_BY(projections_mutex) = false;
     mutable Projections owned_projections TSA_GUARDED_BY(projections_mutex);

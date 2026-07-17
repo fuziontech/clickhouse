@@ -318,8 +318,8 @@ static IMergeTreeDataPart::Checksums checkDataPart(
         assertEOF(*buf);
     }
 
-    /// Projections may be nested inside the part dir or flat siblings of it; detectProjections collects
-    /// both by logical name. Disk truth (the part is being verified), so scan rather than read the cache.
+    /// Projections may be nested inside the part dir or flat siblings of it; detectProjections collects both by logical name. Disk truth
+    /// (the part is being verified), so scan rather than read the cache.
     NameSet projections_on_disk;
     if (!data_part->isProjectionPart())
         for (const auto & [projection_dir, projection] : data_part_storage.detectProjections())

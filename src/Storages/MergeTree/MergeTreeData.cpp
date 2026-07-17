@@ -3483,8 +3483,8 @@ size_t MergeTreeData::clearOrphanProjectionSiblings(size_t max_age_seconds)
         if (disk->isBroken())
             continue;
 
-        /// moving/ is deliberately not scanned: clearOldTemporaryDirectories's stale-moving-parts
-        /// sweep owns it, and an in-flight clone's sibling is ownerless there for the whole copy.
+        /// moving/ is deliberately not scanned: clearOldTemporaryDirectories's stale-moving-parts sweep owns it, and an in-flight clone's
+        /// sibling is ownerless there for the whole copy.
         for (const auto & root : {fs::path(relative_data_path), fs::path(relative_data_path) / DETACHED_DIR_NAME})
         {
             if (!disk->existsDirectory(root))
@@ -3501,8 +3501,8 @@ size_t MergeTreeData::clearOrphanProjectionSiblings(size_t max_age_seconds)
                 if (owner.empty() || disk->existsDirectory(root / owner))
                     continue;
 
-                /// The rename commit window legitimately shows a sibling without its owner dir
-                /// (commit-last); a young orphan may still be adopted, so only reap aged ones.
+                /// The rename commit window legitimately shows a sibling without its owner dir (commit-last); a young orphan may still be
+                /// adopted, so only reap aged ones.
                 if (max_age_seconds && disk->getLastModified(root / entry).epochTime() + time_t(max_age_seconds) > time(nullptr))
                     continue;
 
@@ -5652,8 +5652,8 @@ void MergeTreeData::PartsTemporaryRename::tryRenameAll()
                 throw DB::Exception(ErrorCodes::LOGICAL_ERROR, "Empty part name. Most likely it's a bug.");
             const auto full_path = fs::path(storage.relative_data_path) / source_dir;
 
-            /// Storage-level rename supplies sibling enumeration (from disk truth), the
-            /// stale-destination sweep and the commit-last ordering.
+            /// Storage-level rename supplies sibling enumeration (from disk truth), the stale-destination sweep and the commit-last
+            /// ordering.
             auto part_storage = std::make_shared<DataPartStorageOnDiskFull>(
                 std::make_shared<SingleDiskVolume>("volume_" + old_dir, disk, 0), full_path, old_dir);
             part_storage->setProjections(part_storage->detectProjections());
@@ -7773,8 +7773,8 @@ MergeTreeData::PartsBackupEntries MergeTreeData::backupParts(
 
         auto backup_projection = [&](IDataPartStorage & storage, IMergeTreeDataPart & projection_part)
         {
-            /// A projection backs up under its logical name ("<name>.proj"), so the backup layout
-            /// is independent of the on-disk projection layout.
+            /// A projection backs up under its logical name ("<name>.proj"), so the backup layout is independent of the on-disk projection
+            /// layout.
             storage.backup(
                 projection_part.checksums,
                 projection_part.getFileNamesWithoutChecksums(),
@@ -8682,8 +8682,7 @@ DetachedPartsInfo MergeTreeData::getDetachedParts() const
         /// Note: we don't care about TOCTOU issue here.
         if (disk->existsDirectory(detached_path))
         {
-            /// FLAT projection siblings are folded into their owner entry instead of being
-            /// listed as detached parts of their own.
+            /// FLAT projection siblings are folded into their owner entry instead of being listed as detached parts of their own.
             std::unordered_map<String, size_t> index_by_dir_name;
             Strings sibling_names;
             for (auto it = disk->iterateDirectory(detached_path); it->isValid(); it->next())
@@ -8752,8 +8751,7 @@ void MergeTreeData::dropDetached(const ASTPtr & partition, bool part, ContextPtr
     for (auto & [_, old_dir, new_dir, disk] : renamed_parts.old_and_new_names)
     {
         bool keep_shared = removeDetachedPart(disk, fs::path(relative_data_path) / DETACHED_DIR_NAME / new_dir / "", old_dir);
-        /// tryRenameAll moved the FLAT siblings to "deleting_<part>.<projection>.proj" together
-        /// with the parent; drop them with it.
+        /// tryRenameAll moved the FLAT siblings to "deleting_<part>.<projection>.proj" together with the parent; drop them with it.
         removeDetachedProjectionSiblings(disk, new_dir, keep_shared);
         LOG_DEBUG(log, "Dropped detached part {}, keep shared data: {}", old_dir, keep_shared);
         old_dir.clear();
@@ -10229,8 +10227,7 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> MergeTreeData::cloneAn
             const auto & projection_storage = projection_part->getDataPartStorage();
             for (auto it = projection_storage.iterate(); it->isValid(); it->next())
             {
-                /// The zero-copy keep-list uses the logical projection dir name
-                /// regardless of the on-disk projection layout.
+                /// The zero-copy keep-list uses the logical projection dir name regardless of the on-disk projection layout.
                 auto file_name_with_projection_prefix = fs::path(IDataPartStorage::Projection::dirName(name, false)) / it->name();
                 if (!params.files_to_copy_instead_of_hardlinks.contains(file_name_with_projection_prefix)
                     && it->name() != IMergeTreeDataPart::DELETE_ON_DESTROY_MARKER_FILE_NAME_DEPRECATED

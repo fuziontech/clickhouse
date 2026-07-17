@@ -50,8 +50,8 @@ MutableDataPartStoragePtr DataPartStorageOnDiskFull::create(
 
 MutableDataPartStoragePtr DataPartStorageOnDiskFull::getProjectionStorage(const std::string & dir_name, bool use_parent_transaction) // NOLINT
 {
-    /// Not owned: resolve where the dir would live (e.g. a broken-projection placeholder) without
-    /// registering anything; directories come into existence only through createProjection.
+    /// Not owned: resolve where the dir would live (e.g. a broken-projection placeholder) without registering anything; directories come
+    /// into existence only through createProjection.
     auto owned = tryGetProjection(dir_name);
     const auto projection = owned ? *owned : projectionPlacement(dir_name);
 
@@ -62,6 +62,7 @@ MutableDataPartStoragePtr DataPartStorageOnDiskFull::getProjectionStorage(const 
         std::move(proj_dir),
         use_parent_transaction ? transaction : nullptr));
     projection_storage->projection_storage_format = projection_storage_format;
+    projection_storage->zero_copy_replication_enabled = zero_copy_replication_enabled;
     /// A projection sub-part owns no projections of its own.
     projection_storage->setProjections({});
     return projection_storage;
@@ -79,6 +80,7 @@ DataPartStoragePtr DataPartStorageOnDiskFull::getProjectionStorage(const std::st
         std::move(proj_root),
         std::move(proj_dir));
     projection_storage->projection_storage_format = projection_storage_format;
+    projection_storage->zero_copy_replication_enabled = zero_copy_replication_enabled;
     projection_storage->setProjections({});
     return projection_storage;
 }
@@ -271,7 +273,7 @@ IDataPartStorage::Projection DataPartStorageOnDiskFull::createProjection(const s
     auto projection = projectionPlacement(dir_name);
 
     /// A leftover directory is residue of a failed operation on a same-named part (tmp part names repeat).
-    removeProjectionResidue(projection, /*can_remove_shared_blobs=*/ false);
+    removeProjectionResidue(projection);
 
     executeWriteOperation([&](auto & disk) { disk.createDirectory(projection.relativePath()); });
     addProjection(projection);

@@ -225,8 +225,7 @@ PartitionCommandsResultInfo Unfreezer::unfreezePartitionsFromTableDirectory(Merg
         {
             const auto & partition_directory = it->name();
 
-            /// FLAT projection siblings are not parts: each is removed with its owner below,
-            /// under the owner's keep_shared decision.
+            /// FLAT projection siblings are not parts: each is removed with its owner below, under the owner's keep_shared decision.
             if (IDataPartStorage::Projection::dirNameType(partition_directory) != IDataPartStorage::Projection::Status::None)
                 continue;
 

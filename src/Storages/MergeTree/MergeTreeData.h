@@ -994,12 +994,12 @@ public:
     size_t clearOldTemporaryDirectories(size_t custom_directories_lifetime_seconds, const NameSet & valid_prefixes = {"tmp_", "tmp-fetch_"});
     size_t clearOldTemporaryDirectories(const String & root_path, size_t custom_directories_lifetime_seconds, const NameSet & valid_prefixes);
 
-    /// Removes FLAT projection siblings whose owner part dir does not exist. `max_age_seconds` guards
-    /// the rename commit window (a sibling is briefly ownerless); startup passes 0 (no renames in flight).
+    /// Removes FLAT projection siblings whose owner part dir does not exist. `max_age_seconds` guards the rename commit window (a sibling
+    /// is briefly ownerless); startup passes 0 (no renames in flight).
     size_t clearOrphanProjectionSiblings(size_t max_age_seconds);
 
-    /// Removes FLAT projection siblings of a removed detached part. `keep_shared` must be the value
-    /// removeDetachedPart returned for the owner: its zero-copy lock covers the projection blobs too.
+    /// Removes FLAT projection siblings of a removed detached part. `keep_shared` must be the value removeDetachedPart returned for the
+    /// owner: its zero-copy lock covers the projection blobs too.
     void removeDetachedProjectionSiblings(const DiskPtr & disk, const String & dir_name, bool keep_shared);
 
     size_t clearEmptyParts();
@@ -1222,8 +1222,8 @@ public:
     /// When `settings_changes` is provided, apply the overrides on top of the table settings.
     MergeTreeSettingsPtr getSettings(const SettingsChanges * settings_changes = nullptr) const;
 
-    /// On-disk layout for projection sub-parts of this table's parts (from the `projection_storage_format`
-    /// setting). The single source of truth: read it here wherever a projection directory is created.
+    /// On-disk layout for projection sub-parts of this table's parts (from the `projection_storage_format` setting). The single source of
+    /// truth: read it here wherever a projection directory is created.
     IDataPartStorage::ProjectionStorageFormat getProjectionStorageFormat() const;
 
     StorageMetadataHandle getInMemoryMetadataPtr(ContextPtr query_context, bool bypass_metadata_cache) const override;
