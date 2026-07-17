@@ -67,7 +67,7 @@ void MergeTreeDataPartChecksum::checkSize(const IDataPartStorage & storage, cons
 {
     /// This is a projection, no need to check its size. It may be stored either nested
     /// inside the part directory or as a flat sibling of it, so existsDirectory is not enough.
-    if (name.ends_with(".proj"))
+    if (IDataPartStorage::Projection::dirNameType(name) == IDataPartStorage::Projection::Status::Live)
     {
         if (storage.hasProjection(name))
             return;

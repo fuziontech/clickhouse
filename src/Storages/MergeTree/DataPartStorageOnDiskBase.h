@@ -22,13 +22,24 @@ public:
         std::string root_path_,
         std::string part_dir_);
 
-    ProjectionEntries getProjections() const override;
-    ProjectionEntries detectProjections() const override;
-    void setProjections(ProjectionEntries entries) override;
+    Projections getProjections() const override;
+    void setProjections(Projections projections_) override;
+    Projections detectProjections() const override;
+    Projections detectProjections(const Strings & root_dir_entries) const override;
+    Projections probeProjections(const Strings & candidate_dir_names) const override;
 
-    void removeTempProjection(const std::string & name) override;
-    void renameProjection(const std::string & old_name, const std::string & new_name) override;
-    void syncProjectionStoragePath(const std::string & name, IDataPartStorage & projection_storage) const override;
+    bool hasProjection(const std::string & dir_name) const override;
+    Projection getProjection(const std::string & dir_name) const override;
+    std::optional<Projection> tryGetProjection(const std::string & dir_name) const override;
+    Projection projectionPlacement(const std::string & dir_name) const override;
+
+    std::pair<std::string, std::string> getProjectionRootAndDir(const std::string & dir_name, ProjectionStorageFormat format) const override;
+    bool existsProjectionDir(const std::string & dir_name, ProjectionStorageFormat format) const override;
+
+    void removeProjection(const Projection & projection) override;
+    Projection renameProjection(const Projection & projection, const std::string & new_dir_name) override;
+    void syncProjectionStoragePath(const Projection & projection, IDataPartStorage & projection_storage) const override;
+    void removeProjectionResidue(const Projection & placement, bool can_remove_shared_blobs) override;
 
     ProjectionStorageFormat getProjectionStorageFormat() const override { return projection_storage_format; }
     void setProjectionStorageFormat(ProjectionStorageFormat format) override
@@ -200,14 +211,13 @@ protected:
         std::string part_dir_,
         bool initialize_) const = 0;
 
-    /// {root, dir} of a projection's on-disk location for a layout, derived from the part's current
-    /// root_path/part_dir. Single source of truth, so ProjectionEntry need store only the format.
-    std::pair<std::string, std::string> getProjectionStorageRootAndDir(const std::string & name, ProjectionStorageFormat format) const;
-
-    /// Incremental owned-set updates for createProjection/renameProjection/removeTempProjection;
+    /// Incremental owned-set updates for createProjection/renameProjection/removeProjection;
     /// require an already-seeded set.
-    void addProjection(const std::string & name, ProjectionEntry entry);
-    void dropProjection(const std::string & name);
+    void addProjection(Projection projection_);
+    void dropProjection(const std::string & dir_name);
+
+    /// Repoint at a moved location; unlike setRelativePath, content is guaranteed unchanged, so caches stay.
+    void setPathKeepingCaches(std::string new_root_path, std::string new_part_dir);
 
     /// Lazily load the per-part skp_idx.packed archive (if any), reading it as a standalone disk
     /// file. Subsequent calls return the cached reader, or nullptr when there is no such file --
@@ -265,9 +275,9 @@ protected:
 
     /// The owned projection set. ready=false: never seeded (reads throw); ready=true: authoritative
     /// (absent key = no projection). Paths are derived, so only setRelativePath drops it.
-    mutable std::mutex projection_entries_mutex;
-    mutable bool projection_entries_ready TSA_GUARDED_BY(projection_entries_mutex) = false;
-    mutable ProjectionEntries projection_entries TSA_GUARDED_BY(projection_entries_mutex);
+    mutable std::mutex projections_mutex;
+    mutable bool owned_projections_ready TSA_GUARDED_BY(projections_mutex) = false;
+    mutable Projections owned_projections TSA_GUARDED_BY(projections_mutex);
 
     /// Cached probe state for skp_idx.packed. probed=false means we haven't checked the disk yet;
     /// probed=true with reader=null means we checked and the archive isn't present.

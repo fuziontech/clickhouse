@@ -590,7 +590,7 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
     {
         auto & parent_storage = global_ctx->parent_part->getDataPartStorage();
         parent_storage.createProjection(local_tmp_part_basename);
-        auto data_part_storage = parent_storage.getProjection(local_tmp_part_basename, false);
+        auto data_part_storage = parent_storage.getProjectionStorage(local_tmp_part_basename, false);
         builder.emplace(*global_ctx->data, global_ctx->future_part->name, data_part_storage, getReadSettings());
         builder->withParentPart(global_ctx->parent_part);
     }
@@ -2048,7 +2048,7 @@ bool MergeTask::MergeProjectionsStage::prepareProjections() const
             projection,
             global_ctx->new_data_part.get(),
             projection->with_parent_part_offset ? global_ctx->merged_part_offsets : nullptr,
-            ".proj",
+            IDataPartStorage::Projection::ext(),
             NO_TRANSACTION_PTR,
             global_ctx->data,
             global_ctx->mutator,

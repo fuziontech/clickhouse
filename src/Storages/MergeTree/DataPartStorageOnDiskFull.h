@@ -16,9 +16,8 @@ public:
 
     MergeTreeDataPartStorageType getType() const override { return MergeTreeDataPartStorageType::Full; }
 
-    bool hasProjection(const std::string & name) const override;
-    MutableDataPartStoragePtr getProjection(const std::string & name, bool use_parent_transaction) override; /// NOLINT
-    DataPartStoragePtr getProjection(const std::string & name) const override;
+    MutableDataPartStoragePtr getProjectionStorage(const std::string & dir_name, bool use_parent_transaction) override; /// NOLINT
+    DataPartStoragePtr getProjectionStorage(const std::string & dir_name) const override;
 
     bool exists() const override;
     bool existsDirectory(const std::string & name) const override;
@@ -30,7 +29,7 @@ public:
     std::vector<std::string> getRemotePaths(const std::string & file_name) const override;
     String getUniqueId() const override;
 
-    void createProjection(const std::string & name) override;
+    Projection createProjection(const std::string & dir_name) override;
 
     std::unique_ptr<WriteBufferFromFileBase> writeFile(
         const String & name,

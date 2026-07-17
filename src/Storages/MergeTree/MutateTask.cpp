@@ -1216,8 +1216,8 @@ static NameToNameVector collectFilesForRenames(
         }
         else if (command.type == MutationCommand::Type::DROP_PROJECTION)
         {
-            if (source_part->checksums.has(command.column_name + ".proj"))
-                add_rename(command.column_name + ".proj", "");
+            if (source_part->checksums.has(IDataPartStorage::Projection::dirName(command.column_name, false)))
+                add_rename(IDataPartStorage::Projection::dirName(command.column_name, false), "");
         }
         else if (isWidePart(source_part))
         {
@@ -2252,15 +2252,15 @@ private:
 
         /// Hardlink unchanged projections. getProjections() is the owned set (layout-independent),
         /// so residue siblings of an unrelated same-named part are not carried into the new part.
-        for (const auto & [projection_dir, entry] : ctx->source_part->getDataPartStorage().getProjections())
+        for (const auto & [projection_dir, projection] : ctx->source_part->getDataPartStorage().getProjections())
         {
-            if (entry.is_temp || !entries_to_hardlink.contains(projection_dir))
+            if (projection.is_temp || !entries_to_hardlink.contains(projection_dir))
                 continue;
 
             ctx->new_data_part->getDataPartStorage().createProjection(projection_dir);
 
-            auto projection_data_part_storage_src = ctx->source_part->getDataPartStorage().getProjection(projection_dir);
-            auto projection_data_part_storage_dst = ctx->new_data_part->getDataPartStorage().getProjection(projection_dir);
+            auto projection_data_part_storage_src = ctx->source_part->getDataPartStorage().getProjectionStorage(projection_dir);
+            auto projection_data_part_storage_dst = ctx->new_data_part->getDataPartStorage().getProjectionStorage(projection_dir);
 
             for (auto p_it = projection_data_part_storage_src->iterate(); p_it->isValid(); p_it->next())
             {
@@ -2552,14 +2552,11 @@ private:
             }
         }
 
-        /// Hardlink unchanged projections. getProjections() is the owned set (layout-independent).
-        for (const auto & [projection_dir, entry] : ctx->source_part->getDataPartStorage().getProjections())
+        /// Hardlink unchanged projections from the owned set. No checksums.has() filter here:
+        /// legacy parts own metadata-declared projections that checksums.txt does not reference.
+        for (const auto & [projection_dir, projection] : ctx->source_part->getDataPartStorage().getProjections())
         {
-            /// Same ownership rule as the checksums-driven mutate path: a discovered directory the
-            /// source part does not reference must not be carried into the new part.
-            if (entry.is_temp
-                || ctx->files_to_skip.contains(projection_dir)
-                || !ctx->source_part->checksums.has(projection_dir))
+            if (projection.is_temp || ctx->files_to_skip.contains(projection_dir))
                 continue;
 
             auto rename_it = std::find_if(ctx->files_to_rename.begin(), ctx->files_to_rename.end(), [&projection_dir](const auto & rename_pair)
@@ -2571,8 +2568,8 @@ private:
 
             ctx->new_data_part->getDataPartStorage().createProjection(projection_dir);
 
-            auto projection_data_part_storage_src = ctx->source_part->getDataPartStorage().getProjection(projection_dir);
-            auto projection_data_part_storage_dst = ctx->new_data_part->getDataPartStorage().getProjection(projection_dir);
+            auto projection_data_part_storage_src = ctx->source_part->getDataPartStorage().getProjectionStorage(projection_dir);
+            auto projection_data_part_storage_dst = ctx->new_data_part->getDataPartStorage().getProjectionStorage(projection_dir);
 
             for (auto p_it = projection_data_part_storage_src->iterate(); p_it->isValid(); p_it->next())
             {
@@ -2785,7 +2782,7 @@ private:
                 if (projection_part->checksums.empty())
                     continue;
                 ctx->new_data_part->checksums.addFile(
-                    projection_name + ".proj",
+                    IDataPartStorage::Projection::dirName(projection_name, false),
                     projection_part->checksums.getTotalSizeOnDisk(),
                     projection_part->checksums.getTotalChecksumUInt128());
             }

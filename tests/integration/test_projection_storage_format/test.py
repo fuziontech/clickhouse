@@ -918,8 +918,9 @@ def test_unfreeze_removes_flat_siblings():
     assert check_table("t_unfreeze") == "1"
 
 
-# The periodic cleaner reaps aged orphan siblings (live root and moving/) but never a
-# young one, which may belong to an in-flight rename (commit-last window).
+# The periodic cleaner reaps aged orphan siblings from the live root, but never a young one
+# (it may belong to an in-flight rename). moving/ belongs to the stale-moving-parts sweep of
+# clearOldTemporaryDirectories, which clears everything aged there. Startup (age 0) reaps all.
 def test_orphan_sibling_gc_periodic():
     setup_table(
         "t_gc",
@@ -945,11 +946,13 @@ def test_orphan_sibling_gc_periodic():
     node.query("OPTIMIZE TABLE t_gc FINAL")
     wait_for(lambda: not path_exists(aged))
     assert not path_exists(aged)
+    # the aged moving entry falls to the stale-moving-parts sweep, not the orphan reaper
+    wait_for(lambda: not path_exists(moving_aged))
     assert not path_exists(moving_aged)
     assert path_exists(young)  # age guard: too young to reap
-    node.exec_in_container(
-        ["bash", "-c", f"rm -rf {young}"], privileged=True, user="root"
-    )
+    node.restart_clickhouse()
+    # the startup pass runs with age 0 (nothing in flight): even young orphans go
+    assert not path_exists(young)
 
 
 # always_use_copy_instead_of_hardlinks carries the projection by copying; no inode is
@@ -1015,6 +1018,262 @@ def test_mutation_hardlinks_flat_projection():
     wait_for(lambda: outdated_parts("t_hl") == "0", timeout=120)
     assert check_table("t_hl") == "1"
     assert proj_query("t_hl") != ""
+
+
+# --- Regression tests for review findings (each reproduced the bug before its fix) ---
+
+
+# Finding: the orphan-GC age guard trusts the sibling dir mtime, but moveDirectory never refreshes
+# mtime. During DROP DETACHED PART the parent moves to deleting_<name> first; until the sibling
+# follows, an aged sibling of a perfectly valid in-flight operation looks like a reapable orphan.
+# The failpoint pauses the rename inside that commit window to make the race deterministic.
+def test_orphan_gc_spares_inflight_rename_window():
+    setup_table(
+        "t_race",
+        "projection_storage_format = 'flat', "
+        "merge_tree_clear_old_temporary_directories_interval_seconds = 1",
+    )
+    name = part_name("t_race")
+    root = table_path("t_race")
+    node.query(f"ALTER TABLE t_race DETACH PART '{name}'")
+    sib = f"{root}/detached/{name}.p.proj"
+    assert path_exists(sib)
+    # the trigger inserts below must not create flat siblings of their own: their publish
+    # rename would park on the same failpoint that holds the DROP DETACHED window open
+    node.query("ALTER TABLE t_race MODIFY SETTING materialize_projections_on_insert = 0")
+    # detached parts age naturally; renames never refresh mtime. The aged decoy orphan is a
+    # positive control: its reaping proves the cleaner cycled while the window was open.
+    decoy = f"{root}/detached/gone_0_0_0.p.proj"
+    node.exec_in_container(
+        [
+            "bash",
+            "-c",
+            f"mkdir -p {decoy} && touch -d '2 days ago' {decoy} {sib} {root}/detached/{name}",
+        ],
+        privileged=True,
+        user="root",
+    )
+    node.query("SYSTEM ENABLE FAILPOINT pause_before_flat_projection_sibling_moves")
+    try:
+        drop = node.get_query_request(
+            f"ALTER TABLE t_race DROP DETACHED PART '{name}' SETTINGS allow_drop_detached = 1"
+        )
+        # parent already at deleting_<name>, sibling still waiting at the old name
+        wait_for(
+            lambda: path_exists(f"{root}/detached/deleting_{name}")
+            and path_exists(sib)
+        )
+        assert path_exists(f"{root}/detached/deleting_{name}")
+
+        # nudge the background assignee until the cleaner provably ran inside the window
+        def cleaner_ran():
+            node.query("INSERT INTO t_race SELECT number, number, '' FROM numbers(10)")
+            return not path_exists(decoy)
+
+        wait_for(cleaner_ran, timeout=30)
+        assert not path_exists(decoy)  # positive control: the cleaner cycled
+        still_there = path_exists(sib)
+    finally:
+        node.query(
+            "SYSTEM DISABLE FAILPOINT pause_before_flat_projection_sibling_moves"
+        )
+    drop.get_answer_and_error()  # let the drop finish either way
+    # the cleaner must not reap a sibling whose owner is mid-rename
+    assert still_there
+    assert not node.contains_in_log(f"t_race/detached/{name}.p.proj whose part directory")
+
+
+# Finding: a part that breaks before loadProjections seeds the owned set is detached with an
+# empty set, so its flat sibling stays behind at the live name and the startup orphan GC deletes
+# it. The nested layout preserved projections of broken parts for later repair.
+def test_broken_part_detach_preserves_flat_sibling():
+    setup_table("t_broken", "projection_storage_format = 'flat'")
+    p = part_dir("t_broken")
+    name = part_name("t_broken")
+    root = table_path("t_broken")
+    assert path_exists(f"{p}.p.proj")
+    node.stop_clickhouse()
+    # breaks loadChecksums, i.e. before loadProjections seeds the owned set
+    node.exec_in_container(
+        ["bash", "-c", f"echo garbage > {p}/checksums.txt"],
+        privileged=True,
+        user="root",
+    )
+    node.start_clickhouse()
+    detached_parent = node.exec_in_container(
+        ["bash", "-c", f"find {root}/detached -maxdepth 1 -type d -name 'broken*{name}' | head -1"],
+        privileged=True,
+        user="root",
+    ).strip()
+    assert detached_parent != ""  # the part really was detached as broken
+    # the sibling must follow its part into detached for later repair
+    assert path_exists(f"{detached_parent}.p.proj")
+    # and must not stay stranded at the live name
+    assert not path_exists(f"{p}.p.proj")
+
+
+# Finding: the column-subset mutation refuses to carry a projection that is missing from the
+# source part's checksums.txt. Parts affected by the legacy manifest-regeneration bug (records
+# lost, directory and table metadata intact) load healthy, but any mutation silently drops the
+# projection: the new part has neither the directory nor a broken-projection marker.
+def test_mutation_carries_projection_unreferenced_by_legacy_checksums():
+    node.query("DROP TABLE IF EXISTS t_leg SYNC")
+    node.query("DROP TABLE IF EXISTS t_leg_donor SYNC")
+    node.query("SYSTEM STOP MERGES")
+    # t_leg: projection declared in metadata, but the insert does not materialize it,
+    # so the part's checksums.txt carries no p.proj record - the legacy-bug state.
+    node.query(
+        """CREATE TABLE t_leg (key UInt64, id UInt64, value String,
+           PROJECTION p (SELECT key, id ORDER BY id))
+           ENGINE = MergeTree ORDER BY key
+           SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat',
+               materialize_projections_on_insert = 0"""
+    )
+    node.query(
+        """CREATE TABLE t_leg_donor (key UInt64, id UInt64, value String,
+           PROJECTION p (SELECT key, id ORDER BY id))
+           ENGINE = MergeTree ORDER BY key
+           SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat'"""
+    )
+    for tname in ("t_leg", "t_leg_donor"):
+        node.query(
+            f"INSERT INTO {tname} SELECT number, number * 2, toString(number) FROM numbers(1000)"
+        )
+    donor_sib = f"{part_dir('t_leg_donor')}.p.proj"
+    leg_sib = f"{part_dir('t_leg')}.p.proj"
+    node.stop_clickhouse()
+    node.exec_in_container(
+        ["bash", "-c", f"cp -r {donor_sib} {leg_sib} && chmod -R 777 {leg_sib}"],
+        privileged=True,
+        user="root",
+    )
+    node.start_clickhouse()
+    # the legacy part loads healthy: directory + metadata declaration = owned
+    assert active_projection_parts("t_leg") == "1"
+    assert broken_projection_parts("t_leg") == "0"
+    # a mutation of a column outside the projection must carry the projection unchanged
+    node.query(
+        "ALTER TABLE t_leg UPDATE value = concat(value, 'x') WHERE 1 SETTINGS mutations_sync = 1"
+    )
+    p = part_dir("t_leg")
+    assert path_exists(f"{p}.p.proj")
+    assert active_projection_parts("t_leg") == "1"
+    assert broken_projection_parts("t_leg") == "0"
+    assert node.query("SELECT count() FROM t_leg").strip() == "1000"
+
+
+# Finding: the orphan reaper always keeps remote blobs (keep_in_remote_fs=true). Temp-dir cleanup
+# keeps them only under zero-copy replication; without zero-copy the local refcount is the whole
+# truth, so keeping the blobs of a reaped orphan leaks them in object storage forever.
+def test_orphan_gc_removes_blobs_without_zero_copy():
+    node.query("DROP TABLE IF EXISTS t_leak SYNC")
+    node.query("SYSTEM STOP MERGES")
+    node.query(
+        """CREATE TABLE t_leak (key UInt64, id UInt64, value String,
+           PROJECTION p (SELECT key, id ORDER BY id))
+           ENGINE = MergeTree ORDER BY key
+           SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat',
+               storage_policy = 's3'"""
+    )
+    node.query(
+        "INSERT INTO t_leak SELECT number, number * 2, toString(number) FROM numbers(1000)"
+    )
+    p = part_dir("t_leak")
+    name = part_name("t_leak")
+    uuid = node.query("SELECT uuid FROM system.tables WHERE name = 't_leak'").strip()
+    # local_path is relative to the disk root; the store/<prefix>/<uuid>/ segment is unique per table
+    sibling_keys = set(
+        node.query(
+            f"""SELECT remote_path FROM system.remote_data_paths
+                WHERE local_path LIKE '%/{uuid}/{name}.p.proj/%'"""
+        ).split()
+    )
+    assert sibling_keys  # the projection really lives on the object storage disk
+
+    def minio_keys():
+        return {
+            o.object_name
+            for o in cluster.minio_client.list_objects(
+                cluster.minio_bucket, "data/", recursive=True
+            )
+        }
+
+    assert sibling_keys <= minio_keys()  # sanity: key format matches the listing
+    node.stop_clickhouse()
+    # hide the owner dir: the sibling becomes a genuine orphan of this table
+    node.exec_in_container(
+        ["bash", "-c", f"mv {p} /tmp/hidden_{name}"], privileged=True, user="root"
+    )
+    node.start_clickhouse()
+    # startup GC reaps the orphan sibling metadata
+    wait_for(lambda: not path_exists(f"{p}.p.proj"))
+    assert not path_exists(f"{p}.p.proj")
+    # without zero-copy nothing else can reference these blobs: they must be gone too
+    leaked = sibling_keys & minio_keys()
+    assert leaked == set()
+    node.exec_in_container(
+        ["bash", "-c", f"rm -rf /tmp/hidden_{name}"], privileged=True, user="root"
+    )
+    node.query("DROP TABLE t_leak SYNC")
+
+
+# --- Crash-window recovery coverage (planted states, both rename directions) ---
+
+
+# Publish direction (tmp -> live): a crash after the sibling moved but before the parent moved
+# leaves a live-named sibling and a tmp-named parent. Startup must clear both and adopt nothing.
+def test_crash_window_publish_sibling_first():
+    setup_table("t_cw_pub", "projection_storage_format = 'flat'")
+    root = table_path("t_cw_pub")
+    node.stop_clickhouse()
+    node.exec_in_container(
+        [
+            "bash",
+            "-c",
+            f"mkdir -p {root}/tmp_merge_all_1_1_1 {root}/all_1_1_1.p.proj"
+            f" && touch {root}/tmp_merge_all_1_1_1/stale_marker.txt {root}/all_1_1_1.p.proj/stale_marker.txt"
+            f" && chmod -R 777 {root}/tmp_merge_all_1_1_1 {root}/all_1_1_1.p.proj",
+        ],
+        privileged=True,
+        user="root",
+    )
+    node.start_clickhouse()
+    # the interrupted publish is rolled back completely: tmp parent and committed sibling are gone
+    wait_for(lambda: not path_exists(f"{root}/tmp_merge_all_1_1_1"))
+    assert not path_exists(f"{root}/tmp_merge_all_1_1_1")
+    wait_for(lambda: not path_exists(f"{root}/all_1_1_1.p.proj"))
+    assert not path_exists(f"{root}/all_1_1_1.p.proj")
+    # the real part and its projection are untouched
+    assert active_parts("t_cw_pub") == "1"
+    assert broken_projection_parts("t_cw_pub") == "0"
+    assert check_table("t_cw_pub") == "1"
+
+
+# Removal direction (live -> delete_tmp_): a crash after the parent moved but before the sibling
+# moved leaves a delete_tmp_ parent and a live-named orphan sibling. Startup must clear both.
+def test_crash_window_remove_parent_first():
+    setup_table("t_cw_rm", "projection_storage_format = 'flat'")
+    root = table_path("t_cw_rm")
+    node.stop_clickhouse()
+    node.exec_in_container(
+        [
+            "bash",
+            "-c",
+            f"mkdir -p {root}/delete_tmp_gone_0_0_0 {root}/gone_0_0_0.p.proj"
+            f" && touch {root}/delete_tmp_gone_0_0_0/stale_marker.txt {root}/gone_0_0_0.p.proj/stale_marker.txt"
+            f" && chmod -R 777 {root}/delete_tmp_gone_0_0_0 {root}/gone_0_0_0.p.proj",
+        ],
+        privileged=True,
+        user="root",
+    )
+    node.start_clickhouse()
+    wait_for(lambda: not path_exists(f"{root}/delete_tmp_gone_0_0_0"))
+    assert not path_exists(f"{root}/delete_tmp_gone_0_0_0")
+    wait_for(lambda: not path_exists(f"{root}/gone_0_0_0.p.proj"))
+    assert not path_exists(f"{root}/gone_0_0_0.p.proj")
+    assert active_parts("t_cw_rm") == "1"
+    assert broken_projection_parts("t_cw_rm") == "0"
+    assert check_table("t_cw_rm") == "1"
 
 
 # A failed ATTACH (occupied attaching_ destination) rolls whole parts back; the

@@ -215,13 +215,19 @@ PartitionCommandsResultInfo Unfreezer::unfreezePartitionsFromTableDirectory(Merg
         if (!disk->existsDirectory(table_directory))
             continue;
 
+        /// Group projection siblings by owner up front: one directory scan instead of one per part.
+        std::unordered_map<String, Strings> siblings_by_owner;
+        for (auto it = disk->iterateDirectory(table_directory); it->isValid(); it->next())
+            if (auto owner = IDataPartStorage::Projection::owner(table_directory, it->name()); !owner.empty())
+                siblings_by_owner[owner].push_back(it->name());
+
         for (auto it = disk->iterateDirectory(table_directory); it->isValid(); it->next())
         {
             const auto & partition_directory = it->name();
 
             /// FLAT projection siblings are not parts: each is removed with its owner below,
             /// under the owner's keep_shared decision.
-            if (projectionDirNameType(partition_directory) != ProjectionDirNameType::None)
+            if (IDataPartStorage::Projection::dirNameType(partition_directory) != IDataPartStorage::Projection::Status::None)
                 continue;
 
             /// Partition ID is prefix of part directory name: <partition id>_<rest of part directory name>
@@ -237,12 +243,13 @@ PartitionCommandsResultInfo Unfreezer::unfreezePartitionsFromTableDirectory(Merg
 
             bool keep_shared = removeFrozenPart(disk, path, partition_directory, local_context, zookeeper);
 
-            for (auto sibling_it = disk->iterateDirectory(table_directory); sibling_it->isValid(); sibling_it->next())
+            if (auto sibling_it = siblings_by_owner.find(partition_directory); sibling_it != siblings_by_owner.end())
             {
-                if (projectionSiblingOwner(sibling_it->name()) != partition_directory)
-                    continue;
-                disk->removeSharedRecursive(fs::path(table_directory) / sibling_it->name() / "", keep_shared, {});
-                LOG_DEBUG(log, "Unfrozen projection sibling {} of part {}, keep shared data: {}", sibling_it->name(), partition_directory, keep_shared);
+                for (const auto & sibling : sibling_it->second)
+                {
+                    disk->removeSharedRecursive(fs::path(table_directory) / sibling / "", keep_shared, {});
+                    LOG_DEBUG(log, "Unfrozen projection sibling {} of part {}, keep shared data: {}", sibling, partition_directory, keep_shared);
+                }
             }
 
             result.push_back(PartitionCommandResultInfo{

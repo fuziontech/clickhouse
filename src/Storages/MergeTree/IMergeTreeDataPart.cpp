@@ -964,7 +964,7 @@ void IMergeTreeDataPart::removeIfNeeded()
                                 getDataPartStorage().getPartDirectory(), name);
 
             bool is_moving_part = isMovingPart();
-            if (!startsWith(file_name, "tmp") && !endsWith(file_name, ".tmp_proj") && !is_moving_part)
+            if (!startsWith(file_name, "tmp") && IDataPartStorage::Projection::dirNameType(file_name) != IDataPartStorage::Projection::Status::Temp && !is_moving_part)
             {
                 LOG_ERROR(
                     storage.log,
@@ -1376,8 +1376,8 @@ void IMergeTreeDataPart::loadColumnsChecksumsIndexes(bool require_columns_checks
 MergeTreeDataPartBuilder IMergeTreeDataPart::getProjectionPartBuilder(
     const String & projection_name, ProjectionDescriptionRawPtr projection, bool is_temp_projection)
 {
-    const char * projection_extension = is_temp_projection ? ".tmp_proj" : ".proj";
-    auto projection_storage = getDataPartStorage().getProjection(projection_name + projection_extension, !is_temp_projection);
+    auto projection_storage = getDataPartStorage().getProjectionStorage(
+        IDataPartStorage::Projection::dirName(projection_name, is_temp_projection), !is_temp_projection);
     MergeTreeDataPartBuilder builder(storage, projection_name, projection_storage, getReadSettings());
     return builder.withPartInfo(MergeListElement::FAKE_RESULT_PART_FOR_PROJECTION).withParentPart(this).withProjection(projection);
 }
@@ -1408,25 +1408,22 @@ void IMergeTreeDataPart::loadProjections(
 
     auto metadata_snapshot = storage.getInMemoryMetadataPtr(storage.getContext(), false);
 
-    /// Owned = on-disk dirs referenced by the checksums (survives DROP PROJECTION from the metadata)
-    /// or declared in the metadata; residue and `.tmp_proj` dirs stay out.
-    const auto detected_projections = getDataPartStorage().detectProjections();
-    IDataPartStorage::ProjectionEntries owned_projections;
+    /// Owned = on-disk dirs referenced by the checksums (survives DROP PROJECTION) or declared in the
+    /// metadata; residue and tmp dirs stay out. The manifest names every adoptable dir: probe, don't list.
+    Strings candidate_dir_names;
     for (const auto & [file_name, _] : checksums.files)
-        if (file_name.ends_with(".proj"))
-            if (auto it = detected_projections.find(file_name); it != detected_projections.end())
-                owned_projections.emplace(it->first, it->second);
+        if (IDataPartStorage::Projection::dirNameType(file_name) == IDataPartStorage::Projection::Status::Live)
+            candidate_dir_names.push_back(file_name);
     for (const auto & projection : metadata_snapshot->projections)
-        if (auto it = detected_projections.find(projection.name + ".proj"); it != detected_projections.end())
-            owned_projections.emplace(it->first, it->second);
-    getDataPartStorage().setProjections(std::move(owned_projections));
+        candidate_dir_names.push_back(IDataPartStorage::Projection::dirName(projection.name, false));
+    const auto owned_projections = getDataPartStorage().probeProjections(candidate_dir_names);
+    getDataPartStorage().setProjections(owned_projections);
 
     for (const auto & projection : metadata_snapshot->projections)
     {
-        auto projection_path = projection.name + ".proj";
-        auto detected_it = detected_projections.find(projection_path);
-        /// TODO: also decide if to WARN here if detected_projections has some projections which are not in the metadata/checksums
-        if (detected_it != detected_projections.end())
+        auto projection_path = IDataPartStorage::Projection::dirName(projection.name, false);
+        auto owned_it = owned_projections.find(projection_path);
+        if (owned_it != owned_projections.end())
         {
             /// Membership is decided by the parent directory's presence; an unlisted projection means
             /// some operation diverged from the manifest and deserves a trace.
@@ -1868,31 +1865,31 @@ void IMergeTreeDataPart::loadChecksums(bool require)
         NameSet declared_projections;
         auto metadata_snapshot = storage.getInMemoryMetadataPtr(storage.getContext(), false);
         for (const auto & projection : metadata_snapshot->projections)
-            declared_projections.insert(projection.name + ".proj");
+            declared_projections.insert(IDataPartStorage::Projection::dirName(projection.name, false));
 
-        /// Manifest-less path: ownership comes from disk truth. Seed before reading so getProjection
+        /// Manifest-less path: ownership comes from disk truth. Seed before reading so getProjectionStorage
         /// resolves each dir's actual layout; loadProjections re-seeds against the restored checksums.
-        IDataPartStorage::ProjectionEntries restored_projections;
-        for (const auto & [projection_name, entry] : getDataPartStorage().detectProjections())
+        IDataPartStorage::Projections restored_projections;
+        for (const auto & [projection_dir, projection] : getDataPartStorage().detectProjections())
         {
-            if (entry.is_temp)
+            if (projection.is_temp)
                 continue;
 
-            if (!declared_projections.contains(projection_name))
+            if (!declared_projections.contains(projection_dir))
             {
                 LOG_WARNING(storage.log, "Not restoring checksums record for projection directory {} of part {}: "
-                    "no such projection in the table metadata", projection_name, name);
+                    "no such projection in the table metadata", projection_dir, name);
                 continue;
             }
 
-            restored_projections.emplace(projection_name, entry);
+            restored_projections.emplace(projection_dir, projection);
         }
         getDataPartStorage().setProjections(restored_projections);
 
         static constexpr auto projection_checksums_file = "checksums.txt";
-        for (const auto & [projection_name, entry] : restored_projections)
+        for (const auto & [projection_dir, projection] : restored_projections)
         {
-            auto projection_storage = getDataPartStorage().getProjection(projection_name);
+            auto projection_storage = getDataPartStorage().getProjectionStorage(projection_dir);
             if (!projection_storage->existsFile(projection_checksums_file))
                 continue;
 
@@ -1901,14 +1898,14 @@ void IMergeTreeDataPart::loadChecksums(bool require)
                 MergeTreeDataPartChecksums projection_checksums;
                 auto in = projection_storage->readFile(projection_checksums_file, {}, {});
                 if (projection_checksums.read(*in))
-                    checksums.addFile(projection_name, projection_checksums.getTotalSizeOnDisk(), projection_checksums.getTotalChecksumUInt128());
+                    checksums.addFile(projection_dir, projection_checksums.getTotalSizeOnDisk(), projection_checksums.getTotalChecksumUInt128());
             }
             catch (...)
             {
                 /// A record for an unreadable projection would only mark the part broken; the later
                 /// projection load will handle the directory itself.
                 LOG_WARNING(storage.log, "Cannot restore checksums record for projection {} of part {}: {}",
-                    projection_name, name, getCurrentExceptionMessage(false));
+                    projection_dir, name, getCurrentExceptionMessage(false));
             }
         }
 
@@ -2369,8 +2366,9 @@ void IMergeTreeDataPart::renameTo(const String & new_relative_path, bool remove_
         /// This part is a projection: it renames within its parent (e.g. "p_1.tmp_proj" -> "p.proj").
         /// The parent's storage resolves both dir names from its owned set and keeps that set true.
         auto & parent_storage = const_cast<IMergeTreeDataPart *>(parent_part)->getDataPartStorage();
-        parent_storage.renameProjection(name + (is_temp ? ".tmp_proj" : ".proj"), new_relative_path);
-        parent_storage.syncProjectionStoragePath(new_relative_path, getDataPartStorage());
+        auto renamed = parent_storage.renameProjection(
+            parent_storage.getProjection(IDataPartStorage::Projection::dirName(name, is_temp)), new_relative_path);
+        parent_storage.syncProjectionStoragePath(renamed, getDataPartStorage());
         return;
     }
 
@@ -2385,8 +2383,8 @@ void IMergeTreeDataPart::renameTo(const String & new_relative_path, bool remove_
     /// lost has an in-memory placeholder part but no owned dir, so there is nothing to repoint.
     const auto owned_projections = getDataPartStorage().getProjections();
     for (const auto & [projection_name, part] : projection_parts)
-        if (owned_projections.contains(projection_name + ".proj"))
-            getDataPartStorage().syncProjectionStoragePath(projection_name + ".proj", part->getDataPartStorage());
+        if (auto it = owned_projections.find(IDataPartStorage::Projection::dirName(projection_name, false)); it != owned_projections.end())
+            getDataPartStorage().syncProjectionStoragePath(it->second, part->getDataPartStorage());
 }
 
 std::pair<bool, NameSet> IMergeTreeDataPart::canRemovePart() const
@@ -2423,7 +2421,8 @@ void IMergeTreeDataPart::remove()
     /// be removed. Go through the parent so its owned set drops the entry together with the dir.
     if (isProjectionPart() && is_temp)
     {
-        const_cast<IMergeTreeDataPart *>(parent_part)->getDataPartStorage().removeTempProjection(name + ".tmp_proj");
+        auto & parent_storage = const_cast<IMergeTreeDataPart *>(parent_part)->getDataPartStorage();
+        parent_storage.removeProjection(parent_storage.getProjection(IDataPartStorage::Projection::dirName(name, true)));
         return;
     }
 
@@ -2486,6 +2485,15 @@ std::optional<String> IMergeTreeDataPart::getRelativePathForDetachedPart(const S
 String IMergeTreeDataPart::getRelativePathOfActivePart() const
 {
     return fs::path(getDataPartStorage().getFullRootPath()) / name / "";
+}
+
+void IMergeTreeDataPart::adoptOnDiskProjectionsForDetach()
+{
+    IDataPartStorage::Projections adopted;
+    for (const auto & [projection_dir, projection] : getDataPartStorage().detectProjections())
+        if (!projection.is_temp)
+            adopted.emplace(projection_dir, projection);
+    getDataPartStorage().setProjections(std::move(adopted));
 }
 
 void IMergeTreeDataPart::renameToDetached(const String & prefix, bool ignore_error)
@@ -2655,7 +2663,7 @@ void IMergeTreeDataPart::checkConsistencyBase() const
             catch (const Exception & ex)
             {
                 /// For projection parts check will mark them broken in loadProjections
-                if (!parent_part && filename.ends_with(".proj"))
+                if (!parent_part && IDataPartStorage::Projection::dirNameType(filename) == IDataPartStorage::Projection::Status::Live)
                 {
                     std::string projection_name = fs::path(filename).stem();
                     LOG_INFO(storage.log, "Projection {} doesn't exist on start for part {}, marking it as broken", projection_name, name);

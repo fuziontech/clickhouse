@@ -1086,7 +1086,7 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeProjectionPartImpl(
 
     /// Creates the dir (sweeping any stale leftover from previous runs, which is possible because
     /// the name is not unique) and registers it in the parent's owned set.
-    parent_part->getDataPartStorage().createProjection(part_name + (is_temp ? ".tmp_proj" : ".proj"));
+    parent_part->getDataPartStorage().createProjection(IDataPartStorage::Projection::dirName(part_name, is_temp));
 
     /// If we need to calculate some columns to sort.
     if (metadata_snapshot->hasSortingKey() || metadata_snapshot->hasSecondaryIndices())

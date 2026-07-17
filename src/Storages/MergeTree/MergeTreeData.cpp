@@ -2609,7 +2609,7 @@ void MergeTreeData::loadDataParts(bool skip_sanity_checks, std::optional<std::un
             {
                 /// Skip temporary directories, projection directories, file 'format_version.txt' and directory 'detached'.
                 if (startsWith(it->name(), "tmp")
-                    || projectionDirNameType(it->name()) != ProjectionDirNameType::None
+                    || IDataPartStorage::Projection::dirNameType(it->name()) != IDataPartStorage::Projection::Status::None
                     || it->name() == MergeTreeData::FORMAT_VERSION_FILE_NAME
                     || it->name() == DETACHED_DIR_NAME)
                     continue;
@@ -2753,7 +2753,10 @@ void MergeTreeData::loadDataParts(bool skip_sanity_checks, std::optional<std::un
     bool replicated = dynamic_cast<StorageReplicatedMergeTree *>(this) != nullptr;
     if (!is_static_storage)
         for (auto & part : broken_parts_to_detach)
+        {
+            part->adoptOnDiskProjectionsForDetach();
             part->renameToDetached("broken-on-start", /*ignore_error=*/ replicated); /// detached parts must not have '_' in prefixes
+        }
 
     resetSerializationHints(part_lock);
 
@@ -3068,7 +3071,10 @@ try
 
             chassert(load_state.part);
             if (load_state.is_broken)
+            {
+                load_state.part->adoptOnDiskProjectionsForDetach();
                 load_state.part->renameToDetached("broken-on-start", /*ignore_error=*/ replicated); /// detached parts must not have '_' in prefixes
+            }
         }, Priority{});
     }
     runner.waitForAllToFinishAndRethrowFirstError();
@@ -3161,6 +3167,7 @@ try
             if (res.is_broken)
             {
                 forcefullyRemoveBrokenOutdatedPartFromZooKeeperBeforeDetaching(res.part->name);
+                res.part->adoptOnDiskProjectionsForDetach();
                 res.part->renameToDetached("broken-on-start", /*ignore_error=*/ replicated); /// detached parts must not have '_' in prefixes
             }
             else if (res.part->is_duplicate)
@@ -3476,9 +3483,9 @@ size_t MergeTreeData::clearOrphanProjectionSiblings(size_t max_age_seconds)
         if (disk->isBroken())
             continue;
 
-        for (const auto & root : {fs::path(relative_data_path),
-                                  fs::path(relative_data_path) / DETACHED_DIR_NAME,
-                                  fs::path(relative_data_path) / "moving"})
+        /// moving/ is deliberately not scanned: clearOldTemporaryDirectories's stale-moving-parts
+        /// sweep owns it, and an in-flight clone's sibling is ownerless there for the whole copy.
+        for (const auto & root : {fs::path(relative_data_path), fs::path(relative_data_path) / DETACHED_DIR_NAME})
         {
             if (!disk->existsDirectory(root))
                 continue;
@@ -3487,10 +3494,10 @@ size_t MergeTreeData::clearOrphanProjectionSiblings(size_t max_age_seconds)
             for (auto it = disk->iterateDirectory(root); it->isValid(); it->next())
             {
                 const String entry = it->name();
-                if (projectionDirNameType(entry) == ProjectionDirNameType::None)
+                if (IDataPartStorage::Projection::dirNameType(entry) == IDataPartStorage::Projection::Status::None)
                     continue;
 
-                const String owner = projectionSiblingOwner(entry);
+                const String owner = IDataPartStorage::Projection::owner(root, entry);
                 if (owner.empty() || disk->existsDirectory(root / owner))
                     continue;
 
@@ -3505,10 +3512,16 @@ size_t MergeTreeData::clearOrphanProjectionSiblings(size_t max_age_seconds)
             for (const auto & entry : orphans)
             {
                 LOG_WARNING(log, "Removing orphan projection directory {} whose part directory {} does not exist",
-                    fullPath(disk, root / entry), projectionSiblingOwner(entry));
+                    fullPath(disk, root / entry), IDataPartStorage::Projection::owner(root, entry));
 
-                /// Do not remove blobs if they exist
-                disk->removeSharedRecursive(root / entry / "", true, {});
+                /// Zero-copy replication may share blobs across replicas invisibly to the local refcount.
+                bool keep_shared = false;
+                if (disk->supportZeroCopyReplication() && (*getSettings())[MergeTreeSetting::allow_remote_fs_zero_copy_replication])
+                {
+                    LOG_WARNING(log, "Since zero-copy replication is enabled we are not going to remove blobs from shared storage for {}", fullPath(disk, root / entry));
+                    keep_shared = true;
+                }
+                disk->removeSharedRecursive(root / entry / "", keep_shared, {});
                 ++cleared_count;
             }
         }
@@ -3565,7 +3578,7 @@ size_t MergeTreeData::clearOldTemporaryDirectories(const String & root_path, siz
 
                     /// A flat projection sibling is in use whenever its parent part is.
                     String in_use_name = basename;
-                    if (auto owner = projectionSiblingOwner(basename); !owner.empty())
+                    if (auto owner = IDataPartStorage::Projection::owner(root_path, basename); !owner.empty())
                         in_use_name = owner;
 
                     if (temporary_parts.contains(in_use_name))
@@ -7765,7 +7778,7 @@ MergeTreeData::PartsBackupEntries MergeTreeData::backupParts(
             storage.backup(
                 projection_part.checksums,
                 projection_part.getFileNamesWithoutChecksums(),
-                fs::path{data_path_in_backup} / part->name / (projection_part.name + ".proj"),
+                fs::path{data_path_in_backup} / part->name / IDataPartStorage::Projection::dirName(projection_part.name, false),
                 backup_settings,
                 make_temporary_hard_links,
                 backup_entries_from_part,
@@ -7775,7 +7788,6 @@ MergeTreeData::PartsBackupEntries MergeTreeData::backupParts(
         };
 
         auto projection_parts = part->getProjectionParts();
-        std::string proj_suffix = ".proj";
         std::unordered_set<String> defined_projections;
 
         for (const auto & [projection_name, projection_part] : projection_parts)
@@ -7793,9 +7805,9 @@ MergeTreeData::PartsBackupEntries MergeTreeData::backupParts(
         for (const auto & [name, _] : part->checksums.files)
         {
             auto projection_name = fs::path(name).stem().string();
-            if (endsWith(name, proj_suffix) && !defined_projections.contains(projection_name))
+            if (IDataPartStorage::Projection::dirNameType(name) == IDataPartStorage::Projection::Status::Live && !defined_projections.contains(projection_name))
             {
-                auto projection_storage = part->getDataPartStorage().getProjection(projection_name + proj_suffix);
+                auto projection_storage = part->getDataPartStorage().getProjectionStorage(IDataPartStorage::Projection::dirName(projection_name, false));
                 if (projection_storage->existsFile("checksums.txt"))
                 {
                     auto projection_part
@@ -8676,7 +8688,7 @@ DetachedPartsInfo MergeTreeData::getDetachedParts() const
             Strings sibling_names;
             for (auto it = disk->iterateDirectory(detached_path); it->isValid(); it->next())
             {
-                if (projectionDirNameType(it->name()) != ProjectionDirNameType::None)
+                if (IDataPartStorage::Projection::dirNameType(it->name()) != IDataPartStorage::Projection::Status::None)
                 {
                     sibling_names.push_back(it->name());
                     continue;
@@ -8686,7 +8698,7 @@ DetachedPartsInfo MergeTreeData::getDetachedParts() const
             }
             for (const auto & sibling : sibling_names)
             {
-                auto owner = index_by_dir_name.find(projectionSiblingOwner(sibling));
+                auto owner = index_by_dir_name.find(IDataPartStorage::Projection::owner(detached_path, sibling));
                 /// An orphan sibling (owner gone) stays unlisted; clearOrphanProjectionSiblings reaps it.
                 if (owner != index_by_dir_name.end())
                     res[owner->second].projection_siblings.push_back(sibling);
@@ -10219,7 +10231,7 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> MergeTreeData::cloneAn
             {
                 /// The zero-copy keep-list uses the logical projection dir name
                 /// regardless of the on-disk projection layout.
-                auto file_name_with_projection_prefix = fs::path(name + ".proj") / it->name();
+                auto file_name_with_projection_prefix = fs::path(IDataPartStorage::Projection::dirName(name, false)) / it->name();
                 if (!params.files_to_copy_instead_of_hardlinks.contains(file_name_with_projection_prefix)
                     && it->name() != IMergeTreeDataPart::DELETE_ON_DESTROY_MARKER_FILE_NAME_DEPRECATED
                     && it->name() != VersionMetadata::TXN_VERSION_METADATA_FILE_NAME)
@@ -10508,7 +10520,7 @@ void MergeTreeData::removeDetachedProjectionSiblings(const DiskPtr & disk, const
     fs::path detached_root = fs::path(relative_data_path) / DETACHED_DIR_NAME;
     Strings siblings;
     for (auto it = disk->iterateDirectory(detached_root); it->isValid(); it->next())
-        if (projectionSiblingOwner(it->name()) == dir_name)
+        if (IDataPartStorage::Projection::owner(detached_root, it->name()) == dir_name)
             siblings.push_back(it->name());
 
     for (const auto & name : siblings)

@@ -322,9 +322,9 @@ static IMergeTreeDataPart::Checksums checkDataPart(
     /// both by logical name. Disk truth (the part is being verified), so scan rather than read the cache.
     NameSet projections_on_disk;
     if (!data_part->isProjectionPart())
-        for (const auto & [projection_name, entry] : data_part_storage.detectProjections())
-            if (!entry.is_temp)
-                projections_on_disk.insert(projection_name);
+        for (const auto & [projection_dir, projection] : data_part_storage.detectProjections())
+            if (!projection.is_temp)
+                projections_on_disk.insert(projection_dir);
 
     const auto & checksums_txt_files = checksums_txt.files;
     for (auto it = data_part_storage.iterate(); it->isValid(); it->next())
@@ -332,7 +332,7 @@ static IMergeTreeDataPart::Checksums checkDataPart(
         auto file_name = it->name();
 
         /// We will check projections later.
-        if (data_part_storage.existsDirectory(file_name) && file_name.ends_with(".proj"))
+        if (data_part_storage.existsDirectory(file_name) && IDataPartStorage::Projection::dirNameType(file_name) == IDataPartStorage::Projection::Status::Live)
             continue;
 
         auto checksum_it = checksums_data.files.find(file_name);
@@ -363,13 +363,13 @@ static IMergeTreeDataPart::Checksums checkDataPart(
         if (is_cancelled())
             return {};
 
-        auto projection_file = name + ".proj";
+        auto projection_file = IDataPartStorage::Projection::dirName(name, false);
 
         IMergeTreeDataPart::Checksums projection_checksums;
         try
         {
             bool noop = false;
-            auto projection_storage = data_part_storage.getProjection(projection_file);
+            auto projection_storage = data_part_storage.getProjectionStorage(projection_file);
 
             /// A projection part that failed to load before its columns were set (e.g. because of a
             /// corrupted serialization.json) has an empty column list. Checking against it would
