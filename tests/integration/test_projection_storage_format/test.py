@@ -1616,7 +1616,7 @@ def test_flat_lifecycle_with_fsync_part_directory():
            PROJECTION p (SELECT key, id ORDER BY id))
            ENGINE = MergeTree ORDER BY key
            SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat',
-               fsync_part_directory = 1"""
+               fsync_part_directory = 1, old_parts_lifetime = 1"""
     )
     node.query(
         "INSERT INTO t_fsync SELECT number, number * 2, toString(number) FROM numbers(1000)"
@@ -1626,6 +1626,9 @@ def test_flat_lifecycle_with_fsync_part_directory():
     node.query("ALTER TABLE t_fsync MATERIALIZE PROJECTION q SETTINGS mutations_sync = 2")
     node.query("SYSTEM START MERGES t_fsync")
     node.query("OPTIMIZE TABLE t_fsync FINAL")
+    # drop the outdated source parts first: once the covering part is detached and re-attached
+    # under a new block number, a surviving outdated part would resurrect as active on restart
+    wait_for(lambda: outdated_parts("t_fsync") == "0", timeout=120)
     name = part_name("t_fsync")
     node.query(f"ALTER TABLE t_fsync DETACH PART '{name}'")
     node.query(f"ALTER TABLE t_fsync ATTACH PART '{name}'")
