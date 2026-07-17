@@ -37,7 +37,7 @@ public:
     bool existsProjectionDir(const std::string & dir_name, ProjectionStorageFormat format) const override;
 
     void removeProjection(const Projection & projection) override;
-    Projection renameProjection(const Projection & projection, const std::string & new_dir_name) override;
+    Projection renameProjection(const Projection & projection, const std::string & new_dir_name, bool fsync) override;
     void syncProjectionStoragePath(const Projection & projection, IDataPartStorage & projection_storage) const override;
     void removeProjectionResidue(const Projection & placement) override;
 

@@ -126,10 +126,10 @@ public:
             FLAT,
         };
 
-        const IDataPartStorage * parent;
+        const IDataPartStorage * parent = nullptr;
         String name;                    /// bare logical name: "p", "p_1" -- no extension
-        StorageFormat format;
-        bool is_temp;
+        StorageFormat format = StorageFormat::NONE;
+        bool is_temp = false;
 
         /// "p.proj" / "p_1.tmp_proj" -- the logical key used across the codebase.
         String dirName() const { return dirName(name, is_temp); }
@@ -414,7 +414,8 @@ public:
     virtual void removeProjection(const Projection & projection) = 0;
 
     /// Rename within this part (e.g. "p_1.tmp_proj" -> "p.proj"); layout kept, returns the new descriptor.
-    virtual Projection renameProjection(const Projection & projection, const std::string & new_dir_name) = 0;
+    /// `fsync` makes the rename entry durable (syncs the enclosing directory).
+    virtual Projection renameProjection(const Projection & projection, const std::string & new_dir_name, bool fsync) = 0;
 
     /// Repoints a projection sub-part's storage at where this part's owned set says the projection lives now (used after the part or the
     /// projection dir was renamed).

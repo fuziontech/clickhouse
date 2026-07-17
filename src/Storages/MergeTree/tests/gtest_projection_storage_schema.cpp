@@ -11,11 +11,24 @@ using namespace DB;
 namespace
 {
 
+/// Records which directories get a sync guard requested; the fsync tests assert guard placement.
+struct SyncGuardRecordingDisk : DiskLocal
+{
+    using DiskLocal::DiskLocal;
+    mutable Strings sync_guard_paths;
+
+    SyncGuardPtr getDirectorySyncGuard(const String & path) const override
+    {
+        sync_guard_paths.push_back(path);
+        return DiskLocal::getDirectorySyncGuard(path);
+    }
+};
+
 struct PartStorageFixture
 {
     std::filesystem::path base_path;
     std::string part_dir;
-    DiskPtr disk;
+    std::shared_ptr<SyncGuardRecordingDisk> disk;
     VolumePtr volume;
     std::shared_ptr<DataPartStorageOnDiskFull> storage;
 
@@ -28,7 +41,7 @@ struct PartStorageFixture
         part_dir = "all_1_1_0";
         std::filesystem::create_directories(base_path / part_dir);
 
-        disk = std::make_shared<DiskLocal>("test_disk_" + unique_id, base_path.string());
+        disk = std::make_shared<SyncGuardRecordingDisk>("test_disk_" + unique_id, base_path.string());
         volume = std::make_shared<SingleDiskVolume>("test_volume", disk);
         storage = std::make_shared<DataPartStorageOnDiskFull>(volume, /*root_path=*/ "", part_dir);
     }
@@ -96,7 +109,7 @@ TEST(ProjectionStorageSchema, CreateRenameRemoveMaintainCache)
     ASSERT_TRUE(fixture.storage->hasProjection("p_1.tmp_proj"));
     ASSERT_TRUE(std::filesystem::exists(fixture.base_path / "all_1_1_0.p_1.tmp_proj"));
 
-    fixture.storage->renameProjection(fixture.storage->getProjection("p_1.tmp_proj"), "p.proj");
+    fixture.storage->renameProjection(fixture.storage->getProjection("p_1.tmp_proj"), "p.proj", /*fsync=*/ false);
     EXPECT_FALSE(fixture.storage->hasProjection("p_1.tmp_proj"));
     ASSERT_TRUE(fixture.storage->hasProjection("p.proj"));
     EXPECT_FALSE(std::filesystem::exists(fixture.base_path / "all_1_1_0.p_1.tmp_proj"));
@@ -130,6 +143,50 @@ TEST(ProjectionStorageSchema, DetectProjectionsBothLayouts)
     EXPECT_EQ(detected.at("nested.proj").format, IDataPartStorage::ProjectionStorageFormat::LEGACY_NESTED);
     EXPECT_EQ(detected.at("flat.proj").format, IDataPartStorage::ProjectionStorageFormat::FLAT);
     EXPECT_TRUE(detected.at("tmp.tmp_proj").is_temp);
+}
+
+TEST(ProjectionStorageSchema, RenameFsyncsSiblingNamespace)
+{
+    PartStorageFixture fixture;
+    fixture.storage->setProjectionStorageFormat(IDataPartStorage::ProjectionStorageFormat::FLAT);
+    fixture.storage->setProjections({});
+    fixture.storage->createProjection("p.proj");
+
+    /// Publish (parent moves last): siblings-before-commit sync on the root, the moved dir, the root again.
+    fixture.disk->sync_guard_paths.clear();
+    fixture.storage->rename(/*new_root_path=*/ "", /*new_part_dir=*/ "all_1_1_1", /*log=*/ nullptr,
+                            /*remove_new_dir_if_exists=*/ false, /*fsync_part_dir=*/ true);
+    EXPECT_EQ(fixture.disk->sync_guard_paths, (Strings{"", "all_1_1_1", ""}));
+
+    /// Without the setting nothing is synced.
+    fixture.disk->sync_guard_paths.clear();
+    fixture.storage->rename("", "all_1_1_2", nullptr, false, /*fsync_part_dir=*/ false);
+    EXPECT_TRUE(fixture.disk->sync_guard_paths.empty());
+}
+
+TEST(ProjectionStorageSchema, RenameProjectionFsyncsEnclosingDir)
+{
+    PartStorageFixture fixture;
+    fixture.storage->setProjectionStorageFormat(IDataPartStorage::ProjectionStorageFormat::FLAT);
+    fixture.storage->setProjections({});
+
+    /// FLAT: the rename entry lives in the parts root.
+    fixture.storage->createProjection("p_1.tmp_proj");
+    fixture.disk->sync_guard_paths.clear();
+    fixture.storage->renameProjection(fixture.storage->getProjection("p_1.tmp_proj"), "p.proj", /*fsync=*/ true);
+    EXPECT_EQ(fixture.disk->sync_guard_paths, (Strings{""}));
+
+    /// NESTED: the rename entry lives in the part dir.
+    fixture.storage->setProjectionStorageFormat(IDataPartStorage::ProjectionStorageFormat::LEGACY_NESTED);
+    fixture.storage->createProjection("q_1.tmp_proj");
+    fixture.disk->sync_guard_paths.clear();
+    fixture.storage->renameProjection(fixture.storage->getProjection("q_1.tmp_proj"), "q.proj", /*fsync=*/ true);
+    EXPECT_EQ(fixture.disk->sync_guard_paths, (Strings{"all_1_1_0"}));
+
+    /// fsync=false requests no guards.
+    fixture.disk->sync_guard_paths.clear();
+    fixture.storage->renameProjection(fixture.storage->getProjection("q.proj"), "q_1.tmp_proj", /*fsync=*/ false);
+    EXPECT_TRUE(fixture.disk->sync_guard_paths.empty());
 }
 
 TEST(ProjectionStorageSchema, ProbeProjectionsBothLayouts)

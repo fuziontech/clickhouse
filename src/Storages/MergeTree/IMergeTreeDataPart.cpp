@@ -126,6 +126,7 @@ namespace Setting
 
 namespace ErrorCodes
 {
+    extern const int BROKEN_PROJECTION;
     extern const int CANNOT_READ_ALL_DATA;
     extern const int LOGICAL_ERROR;
     extern const int NO_FILE_IN_DATA_PART;
@@ -1427,7 +1428,8 @@ void IMergeTreeDataPart::loadProjections(
         {
             /// Membership is decided by the parent directory's presence; an unlisted projection means some operation diverged from the
             /// manifest and deserves a trace.
-            if (!checksums.empty() && !checksums.has(projection_path))
+            const bool unreferenced = !checksums.empty() && !checksums.has(projection_path);
+            if (unreferenced)
                 LOG_WARNING(storage.log, "Part {} loads projection {} that is not referenced by its checksums.txt", name, projection.name);
 
             if (hasProjection(projection.name))
@@ -1440,12 +1442,16 @@ void IMergeTreeDataPart::loadProjections(
             {
                 auto part = getProjectionPartBuilder(projection.name, &projection).withPartFormatFromDisk().build();
 
+                bool loaded = false;
                 try
                 {
                     if (only_metadata)
                         part->loadChecksums(require_columns_checksums);
                     else
+                    {
                         part->loadColumnsChecksumsIndexes(require_columns_checksums, check_consistency);
+                        loaded = true;
+                    }
                 }
                 catch (...)
                 {
@@ -1458,6 +1464,63 @@ void IMergeTreeDataPart::loadProjections(
 
                     has_broken_projection = true;
                     part->setBrokenReason(message, getCurrentExceptionCode());
+                }
+
+                /// FLAT dirs live in the shared parts root, so unlike a NESTED child the name alone is not
+                /// provenance: an unreferenced dir is either this part's own after a manifest loss (trust the
+                /// disk again and heal the record in place) or residue of another same-named part generation.
+                /// The row arithmetic against the parent tells them apart before the record is notarized.
+                if (loaded && unreferenced && owned_it->second.format == IDataPartStorage::ProjectionStorageFormat::FLAT)
+                {
+                    const bool rows_ok = projection.type == ProjectionDescription::Type::Aggregate
+                        ? part->rows_count <= rows_count
+                        : part->rows_count == rows_count;
+
+                    /// Structural tie to the CURRENT declaration: every declared column must exist on disk with
+                    /// the same type. Extra on-disk columns are tolerated (_row_exists after lightweight deletes),
+                    /// and full equality would false-reject parts that legitimately lag the metadata after an
+                    /// ALTER (see the matching caveat in checkDataPart.cpp).
+                    String structure_mismatch;
+                    for (const auto & declared : projection.sample_block)
+                    {
+                        auto on_disk = part->tryGetColumn(declared.name);
+                        if (!on_disk || !on_disk->type->equals(*declared.type))
+                        {
+                            structure_mismatch = fmt::format("declared column {} of type {} is {} on disk",
+                                declared.name, declared.type->getName(),
+                                on_disk ? "of type " + on_disk->type->getName() : "missing");
+                            break;
+                        }
+                    }
+
+                    if (rows_ok && structure_mismatch.empty())
+                    {
+                        LOG_WARNING(storage.log,
+                            "Part {} adopts flat projection {} that is not referenced by its checksums.txt "
+                            "(row and structure checks passed: {} rows vs parent {}); restoring the checksums record in place",
+                            name, projection.name, part->rows_count, rows_count);
+                        checksums.addFile(projection_path, part->checksums.getTotalSizeOnDisk(), part->checksums.getTotalChecksumUInt128());
+                        if (!getDataPartStorage().isReadonly())
+                        {
+                            writeChecksums(checksums, {});
+                            bytes_on_disk = checksums.getTotalSizeOnDisk();
+                        }
+                    }
+                    else
+                    {
+                        String reason = !rows_ok
+                            ? fmt::format("its row count {} contradicts the parent's {}", part->rows_count, rows_count)
+                            : structure_mismatch;
+                        LOG_ERROR(storage.log,
+                            "Part {} refuses to adopt flat projection {}: not referenced by checksums.txt and {} "
+                            "- marking it broken as residue of another part generation",
+                            name, projection.name, reason);
+                        part->setBrokenReason(
+                            fmt::format("Flat projection directory {} is not referenced by checksums.txt and {}",
+                                projection_path, reason),
+                            ErrorCodes::BROKEN_PROJECTION);
+                        has_broken_projection = true;
+                    }
                 }
 
                 addProjectionPart(projection.name, std::move(part));
@@ -2367,7 +2430,8 @@ void IMergeTreeDataPart::renameTo(const String & new_relative_path, bool remove_
         /// dir names from its owned set and keeps that set true.
         auto & parent_storage = const_cast<IMergeTreeDataPart *>(parent_part)->getDataPartStorage();
         auto renamed = parent_storage.renameProjection(
-            parent_storage.getProjection(IDataPartStorage::Projection::dirName(name, is_temp)), new_relative_path);
+            parent_storage.getProjection(IDataPartStorage::Projection::dirName(name, is_temp)), new_relative_path,
+            (*storage.getSettings())[MergeTreeSetting::fsync_part_directory]);
         parent_storage.syncProjectionStoragePath(renamed, getDataPartStorage());
         return;
     }

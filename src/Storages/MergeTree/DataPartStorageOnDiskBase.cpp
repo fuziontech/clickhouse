@@ -863,13 +863,25 @@ void DataPartStorageOnDiskBase::rename(
         for (const auto & [proj_from, proj_to] : flat_projection_moves)
             disk.moveDirectory(proj_from, proj_to);
 
+        /// Rename entries live in the enclosing directory: make the sibling moves durable before
+        /// the parent's move commits the part (commit-last must hold across power loss too).
+        if (fsync_part_dir && !parent_moves_first && !flat_projection_moves.empty())
+        {
+            SyncGuardPtr siblings_sync_guard = volume->getDisk()->getDirectorySyncGuard(new_root_path);
+        }
+
         if (!parent_moves_first)
             disk.moveDirectory(from, to);
 
         /// Only after moveDirectory() since before the directory does not exist.
         SyncGuardPtr to_sync_guard;
+        SyncGuardPtr root_sync_guard;
         if (fsync_part_dir)
+        {
             to_sync_guard = volume->getDisk()->getDirectorySyncGuard(to);
+            /// The rename entries themselves live in the root, not in `to`.
+            root_sync_guard = volume->getDisk()->getDirectorySyncGuard(new_root_path);
+        }
     });
 
     part_dir = new_part_dir;
@@ -1056,7 +1068,7 @@ void DataPartStorageOnDiskBase::removeProjection(const Projection & projection)
     dropProjection(projection.dirName());
 }
 
-Projection DataPartStorageOnDiskBase::renameProjection(const Projection & projection, const std::string & new_dir_name)
+Projection DataPartStorageOnDiskBase::renameProjection(const Projection & projection, const std::string & new_dir_name, bool fsync)
 {
     if (!hasProjection(projection.dirName()))
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown projection {} in part {}", projection.dirName(), getRelativePath());
@@ -1070,6 +1082,11 @@ Projection DataPartStorageOnDiskBase::renameProjection(const Projection & projec
     const auto [from_root, from_dir] = getProjectionRootAndDir(projection.dirName(), projection.format);
     const auto [to_root, to_dir] = getProjectionRootAndDir(renamed.dirName(), renamed.format);
     executeWriteOperation([&](auto & disk) { disk.moveDirectory(fs::path(from_root) / from_dir, fs::path(to_root) / to_dir); });
+    if (fsync)
+    {
+        /// The rename entry lives in the enclosing dir (NESTED: the part dir, FLAT: the parts root).
+        SyncGuardPtr sync_guard = volume->getDisk()->getDirectorySyncGuard(to_root);
+    }
     dropProjection(projection.dirName());
     addProjection(renamed);
     return renamed;

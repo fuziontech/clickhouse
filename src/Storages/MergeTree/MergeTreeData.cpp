@@ -5657,6 +5657,8 @@ void MergeTreeData::PartsTemporaryRename::tryRenameAll()
             auto part_storage = std::make_shared<DataPartStorageOnDiskFull>(
                 std::make_shared<SingleDiskVolume>("volume_" + old_dir, disk, 0), full_path, old_dir);
             part_storage->setProjections(part_storage->detectProjections());
+            part_storage->setZeroCopyReplicationEnabled(
+                (*storage.getSettings())[MergeTreeSetting::allow_remote_fs_zero_copy_replication]);
             part_storage->rename(full_path, new_dir, storage.log.load(), /*remove_new_dir_if_exists=*/ false, /*fsync_part_dir=*/ false);
         }
         catch (...)
@@ -5687,6 +5689,8 @@ void MergeTreeData::PartsTemporaryRename::rollBackAll()
             auto part_storage = std::make_shared<DataPartStorageOnDiskFull>(
                 std::make_shared<SingleDiskVolume>("volume_" + new_dir, disk, 0), full_path, new_dir);
             part_storage->setProjections(part_storage->detectProjections());
+            part_storage->setZeroCopyReplicationEnabled(
+                (*storage.getSettings())[MergeTreeSetting::allow_remote_fs_zero_copy_replication]);
             part_storage->rename(full_path, old_dir, storage.log.load(), /*remove_new_dir_if_exists=*/ false, /*fsync_part_dir=*/ false);
         }
         catch (...)

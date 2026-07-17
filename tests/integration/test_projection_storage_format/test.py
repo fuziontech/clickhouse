@@ -807,6 +807,266 @@ def test_repair_skips_undeclared_projection_dir():
     )
 
 
+# --- Manifest-desync adoption policy: trust-and-heal with a row check ---
+# A projection dir present on disk and declared in metadata but missing from checksums.txt is
+# either (L) this part's own dir after a manifest loss, or (F) residue of another same-named part
+# generation. NESTED dirs are provably (L) (they live inside the part dir): warn + load, no
+# rewrite. FLAT dirs are ambiguous: the row check against the parent decides, a pass heals the
+# checksums record in place, a failure marks the projection broken.
+# (Full manifest loss - checksums.txt deleted outright - is covered above by
+# test_repair_regenerates_projection_records / test_repair_skips_undeclared_projection_dir.)
+
+
+def _make_desync_pair(
+    prefix,
+    extra="",
+    donor_rows=1000,
+    donor_offset=0,
+    projection="p (SELECT key, id ORDER BY id)",
+    donor_projection=None,
+    donor_id_type="UInt64",
+):
+    """Victim table whose part has NO projection dir/record + a donor providing a real dir.
+    The donor knobs shape the planted dir: row count/values, projection definition, column type."""
+    donor_projection = donor_projection or projection
+    node.query(f"DROP TABLE IF EXISTS {prefix} SYNC")
+    node.query(f"DROP TABLE IF EXISTS {prefix}_donor SYNC")
+    node.query("SYSTEM STOP MERGES")
+    settings = "min_bytes_for_wide_part = 0"
+    if extra:
+        settings += ", " + extra
+    node.query(
+        f"""CREATE TABLE {prefix} (key UInt64, id UInt64, value String,
+           PROJECTION {projection})
+           ENGINE = MergeTree ORDER BY key
+           SETTINGS {settings}, materialize_projections_on_insert = 0"""
+    )
+    node.query(
+        f"""CREATE TABLE {prefix}_donor (key UInt64, id {donor_id_type}, value String,
+           PROJECTION {donor_projection})
+           ENGINE = MergeTree ORDER BY key
+           SETTINGS {settings}"""
+    )
+    node.query(
+        f"INSERT INTO {prefix} SELECT number, number * 2, toString(number) FROM numbers(1000)"
+    )
+    node.query(
+        f"INSERT INTO {prefix}_donor SELECT number, number * 2, toString(number) FROM numbers({donor_offset}, {donor_rows})"
+    )
+
+
+def _manifest_mentions_projection(part_path):
+    return (
+        node.exec_in_container(
+            ["bash", "-c", f"grep -aco 'p\\.proj' {part_path}/checksums.txt || true"],
+            privileged=True,
+            user="root",
+        ).strip()
+        != "0"
+    )
+
+
+# LEGACY bug coverage: old servers regenerated checksums.txt WITHOUT projection records
+# (loadChecksums ran before loadProjections). Such NESTED parts must keep loading their
+# projection: warn-only, no in-place rewrite - a nested dir's provenance is certain.
+def test_legacy_nested_projection_missing_from_checksums():
+    _make_desync_pair("t_ln")
+    p = part_dir("t_ln")
+    donor_proj = f"{part_dir('t_ln_donor')}/p.proj"
+    node.stop_clickhouse()
+    node.exec_in_container(
+        ["bash", "-c", f"cp -r {donor_proj} {p}/p.proj && chmod -R 777 {p}/p.proj"],
+        privileged=True,
+        user="root",
+    )
+    node.start_clickhouse()
+    assert active_projection_parts("t_ln") == "1"
+    assert broken_projection_parts("t_ln") == "0"
+    assert node.contains_in_log(
+        "loads projection p that is not referenced by its checksums.txt"
+    )
+    # nested adoption never rewrites the manifest
+    assert not _manifest_mentions_projection(p)
+    assert proj_query("t_ln", extra_settings="force_optimize_projection = 1") != ""
+
+
+# LEGACY bug + conversion to FLAT: a record-less nested part survives the table switching to
+# 'flat'; the next merge rewrites the part in the flat layout with a complete manifest.
+def test_legacy_nested_part_converted_to_flat():
+    _make_desync_pair("t_conv")
+    p = part_dir("t_conv")
+    donor_proj = f"{part_dir('t_conv_donor')}/p.proj"
+    node.stop_clickhouse()
+    node.exec_in_container(
+        ["bash", "-c", f"cp -r {donor_proj} {p}/p.proj && chmod -R 777 {p}/p.proj"],
+        privileged=True,
+        user="root",
+    )
+    node.start_clickhouse()
+    assert active_projection_parts("t_conv") == "1"
+    node.query("ALTER TABLE t_conv MODIFY SETTING projection_storage_format = 'flat'")
+    node.query("SYSTEM START MERGES t_conv")
+    node.query("OPTIMIZE TABLE t_conv FINAL")
+    merged = part_dir("t_conv")
+    assert merged != p  # the merge really produced a new part
+    assert path_exists(f"{merged}.p.proj")
+    assert not path_exists(f"{merged}/p.proj")
+    assert _manifest_mentions_projection(merged)  # rewritten part has a complete manifest
+    assert broken_projection_parts("t_conv") == "0"
+    assert proj_query("t_conv", extra_settings="force_optimize_projection = 1") != ""
+
+
+# NEW (O2 heal): a healthy FLAT part whose checksums.txt lost the projection record. Rows match
+# the parent, so the dir is adopted AND the record is restored in place; next load is clean.
+def test_flat_projection_record_healed_in_place():
+    _make_desync_pair("t_heal", "projection_storage_format = 'flat'")
+    p = part_dir("t_heal")
+    donor_sib = f"{part_dir('t_heal_donor')}.p.proj"
+    node.stop_clickhouse()
+    node.exec_in_container(
+        ["bash", "-c", f"mv {donor_sib} {p}.p.proj"], privileged=True, user="root"
+    )
+    node.start_clickhouse()
+    assert active_projection_parts("t_heal") == "1"
+    assert broken_projection_parts("t_heal") == "0"
+    assert node.contains_in_log("restoring the checksums record in place")
+    assert _manifest_mentions_projection(p)  # healed on disk
+    # the healed manifest survives a reload
+    node.restart_clickhouse()
+    assert active_projection_parts("t_heal") == "1"
+    assert broken_projection_parts("t_heal") == "0"
+    assert proj_query("t_heal", extra_settings="force_optimize_projection = 1") != ""
+
+
+# NEW (O4 reject): foreign FLAT residue - a dir from a DIFFERENT part generation (row count
+# contradicts the parent) must be neither served nor notarized: marked broken, dir preserved.
+def test_flat_foreign_projection_rejected_by_row_check():
+    _make_desync_pair("t_rej", "projection_storage_format = 'flat'", donor_rows=500)
+    p = part_dir("t_rej")
+    donor_sib = f"{part_dir('t_rej_donor')}.p.proj"
+    node.stop_clickhouse()
+    node.exec_in_container(
+        ["bash", "-c", f"mv {donor_sib} {p}.p.proj"], privileged=True, user="root"
+    )
+    node.start_clickhouse()
+    assert broken_projection_parts("t_rej") == "1"
+    assert node.contains_in_log("refuses to adopt flat projection")
+    assert not _manifest_mentions_projection(p)  # never notarized
+    assert path_exists(f"{p}.p.proj")  # preserved for inspection
+    # the parent data is intact and queries work without the projection
+    assert node.query("SELECT count() FROM t_rej").strip() == "1000"
+
+
+# NEW (O4 reject, CAUGHT): same row count but a different projection DEFINITION - a declared
+# column is missing on disk. The structure check refuses and never notarizes.
+def test_flat_foreign_projection_rejected_by_structure():
+    _make_desync_pair(
+        "t_struct", "projection_storage_format = 'flat'",
+        donor_projection="p (SELECT key, value ORDER BY value)",  # no `id` on disk
+    )
+    p = part_dir("t_struct")
+    donor_sib = f"{part_dir('t_struct_donor')}.p.proj"
+    node.stop_clickhouse()
+    node.exec_in_container(
+        ["bash", "-c", f"mv {donor_sib} {p}.p.proj"], privileged=True, user="root"
+    )
+    node.start_clickhouse()
+    assert broken_projection_parts("t_struct") == "1"
+    assert node.contains_in_log("declared column id of type UInt64 is missing on disk")
+    assert not _manifest_mentions_projection(p)
+    assert path_exists(f"{p}.p.proj")
+
+
+# NEW (O4 reject, CAUGHT): identical projection definition and row count, but a column TYPE
+# differs (the donor generation had `id Int64`). The type equality check refuses.
+def test_flat_foreign_projection_rejected_by_column_type():
+    _make_desync_pair(
+        "t_type", "projection_storage_format = 'flat'", donor_id_type="Int64"
+    )
+    p = part_dir("t_type")
+    donor_sib = f"{part_dir('t_type_donor')}.p.proj"
+    node.stop_clickhouse()
+    node.exec_in_container(
+        ["bash", "-c", f"mv {donor_sib} {p}.p.proj"], privileged=True, user="root"
+    )
+    node.start_clickhouse()
+    assert broken_projection_parts("t_type") == "1"
+    assert node.contains_in_log("declared column id of type UInt64 is of type Int64 on disk")
+    assert not _manifest_mentions_projection(p)
+
+
+# NEW (O2 tolerance, ADOPTED BY DESIGN): extra on-disk columns beyond the declaration are
+# tolerated - the class that covers _row_exists after lightweight deletes and legitimate
+# metadata lag after an ALTER. Declared columns match, rows match -> healed.
+def test_flat_projection_extra_columns_tolerated():
+    _make_desync_pair(
+        "t_extra", "projection_storage_format = 'flat'",
+        donor_projection="p (SELECT key, id, value ORDER BY id)",  # superset of declared (key, id)
+    )
+    p = part_dir("t_extra")
+    donor_sib = f"{part_dir('t_extra_donor')}.p.proj"
+    node.stop_clickhouse()
+    node.exec_in_container(
+        ["bash", "-c", f"mv {donor_sib} {p}.p.proj"], privileged=True, user="root"
+    )
+    node.start_clickhouse()
+    assert active_projection_parts("t_extra") == "1"
+    assert broken_projection_parts("t_extra") == "0"
+    assert node.contains_in_log("restoring the checksums record in place")
+    assert _manifest_mentions_projection(p)
+
+
+# NEW (KNOWN LIMIT, NOT CAUGHT): identical definition AND identical row count but DIFFERENT data
+# (another generation of the same-named part). No cheap evidence distinguishes it - the dir is
+# adopted and notarized, and queries through the projection return the foreign rows. This test
+# documents the residual hole of the trust-and-heal policy; closing it would need content
+# validation (hashing projection data against the parent), which load time cannot afford.
+def test_flat_foreign_projection_same_shape_not_caught():
+    _make_desync_pair(
+        "t_hole", "projection_storage_format = 'flat'", donor_offset=1000  # rows 1000..1999
+    )
+    p = part_dir("t_hole")
+    donor_sib = f"{part_dir('t_hole_donor')}.p.proj"
+    node.stop_clickhouse()
+    node.exec_in_container(
+        ["bash", "-c", f"mv {donor_sib} {p}.p.proj"], privileged=True, user="root"
+    )
+    node.start_clickhouse()
+    # adopted and notarized: the gate cannot tell this residue from a legit desync
+    assert active_projection_parts("t_hole") == "1"
+    assert _manifest_mentions_projection(p)
+    # ...and the projection serves the donor's rows (ids 2000+ -> nothing under 200),
+    # while the parent's data says 100 rows. The documented wrong-results hole.
+    direct = node.query(
+        "SELECT count() FROM t_hole WHERE id < 200 SETTINGS optimize_use_projections = 0"
+    ).strip()
+    via_projection = node.query(
+        "SELECT count() FROM t_hole WHERE id < 200 "
+        "SETTINGS optimize_use_projections = 1, force_optimize_projection = 1"
+    ).strip()
+    assert direct == "100"
+    assert via_projection == "0"  # if this ever equals `direct`, the hole got closed - update this test
+
+
+# NEW (O2 heal, Aggregate branch): an aggregating projection legitimately has FEWER rows than the
+# parent; the row check is `<=` there. Same-definition desync must still heal.
+def test_flat_aggregate_projection_desync_healed():
+    _make_desync_pair(
+        "t_agg", "projection_storage_format = 'flat'",
+        projection="p (SELECT key % 10 AS bucket, sum(id) GROUP BY bucket)",
+    )
+    p = part_dir("t_agg")
+    donor_sib = f"{part_dir('t_agg_donor')}.p.proj"
+    node.stop_clickhouse()
+    node.exec_in_container(
+        ["bash", "-c", f"mv {donor_sib} {p}.p.proj"], privileged=True, user="root"
+    )
+    node.start_clickhouse()
+    assert active_projection_parts("t_agg") == "1"
+    assert broken_projection_parts("t_agg") == "0"
+    assert _manifest_mentions_projection(p)
+
+
 # After DETACH PART on a FLAT table, system.detached_parts shows one entry (no junk row for the sibling)
 # whose bytes_on_disk includes the sibling, and DROP DETACHED PART removes the sibling too.
 # https://github.com/ClickHouse/ClickHouse/pull/108443#discussion_r3569019447
@@ -1280,6 +1540,173 @@ def test_publish_sweep_removes_blobs_without_zero_copy():
     assert node.query("SELECT count() FROM t_sweep").strip() == "100"
     node.query("DROP TABLE t_sweep SYNC")
     node.query("DROP TABLE t_sweep_donor SYNC")
+
+
+# Finding: PartsTemporaryRename built its storages without the zero-copy flag, so the ATTACH-path
+# destination sweep (residue at the attaching_ name) always kept remote blobs - same S3 leak.
+def test_attach_sweep_removes_blobs_without_zero_copy():
+    node.query("DROP TABLE IF EXISTS t_att SYNC")
+    node.query("DROP TABLE IF EXISTS t_att_donor SYNC")
+    node.query("SYSTEM STOP MERGES")
+    for tname in ("t_att", "t_att_donor"):
+        node.query(
+            f"""CREATE TABLE {tname} (key UInt64, id UInt64, value String,
+               PROJECTION p (SELECT key, id ORDER BY id))
+               ENGINE = MergeTree ORDER BY key
+               SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat',
+                   storage_policy = 's3'"""
+        )
+        node.query(
+            f"INSERT INTO {tname} SELECT number, number * 2, toString(number) FROM numbers(1000)"
+        )
+    name = part_name("t_att")
+    node.query(f"ALTER TABLE t_att DETACH PART '{name}'")
+
+    donor_sib = f"{part_dir('t_att_donor')}.p.proj"
+    donor_uuid = node.query(
+        "SELECT uuid FROM system.tables WHERE name = 't_att_donor'"
+    ).strip()
+    donor_part = part_name("t_att_donor")
+    sibling_keys = set(
+        node.query(
+            f"""SELECT remote_path FROM system.remote_data_paths
+                WHERE local_path LIKE '%/{donor_uuid}/{donor_part}.p.proj/%'"""
+        ).split()
+    )
+    assert sibling_keys
+
+    def minio_keys():
+        return {
+            o.object_name
+            for o in cluster.minio_client.list_objects(
+                cluster.minio_bucket, "data/", recursive=True
+            )
+        }
+
+    assert sibling_keys <= minio_keys()  # sanity: key format matches the listing
+    # plant the donor's sibling (real metadata, sane refcounts, unshared blobs) as residue at the
+    # attaching_ destination name; mv, not cp - a metadata copy would lie about blob refcounts
+    residue = f"{table_path('t_att')}/detached/attaching_{name}.p.proj"
+    node.exec_in_container(
+        ["bash", "-c", f"mv {donor_sib} {residue}"], privileged=True, user="root"
+    )
+    # ATTACH renames detached/<name> to detached/attaching_<name>; the destination sweep must
+    # remove the residue together with its blobs
+    node.query(f"ALTER TABLE t_att ATTACH PART '{name}'")
+    # the sweep really fired (path-specific: the generic message appears in other tests' logs too)
+    assert node.contains_in_log(f"detached/attaching_{name}.p.proj")
+    assert not path_exists(residue)
+    leaked = sibling_keys & minio_keys()
+    assert leaked == set()
+    # the attached part serves its own projection
+    assert broken_projection_parts("t_att") == "0"
+    assert proj_query("t_att", extra_settings="force_optimize_projection = 1") != ""
+    node.query("DROP TABLE t_att SYNC")
+    node.query("DROP TABLE t_att_donor SYNC")
+
+
+# F5 smoke (NEW): fsync_part_directory=1 exercises the directory-sync points added for flat
+# siblings (sibling namespace on publish, projection rename). Pins wiring across the lifecycle;
+# power-loss durability itself is untestable in CI (guard placement is pinned by the gtest).
+def test_flat_lifecycle_with_fsync_part_directory():
+    node.query("DROP TABLE IF EXISTS t_fsync SYNC")
+    node.query("SYSTEM STOP MERGES")
+    node.query(
+        """CREATE TABLE t_fsync (key UInt64, id UInt64, value String,
+           PROJECTION p (SELECT key, id ORDER BY id))
+           ENGINE = MergeTree ORDER BY key
+           SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat',
+               fsync_part_directory = 1"""
+    )
+    node.query(
+        "INSERT INTO t_fsync SELECT number, number * 2, toString(number) FROM numbers(1000)"
+    )
+    assert path_exists(f"{part_dir('t_fsync')}.p.proj")
+    node.query("ALTER TABLE t_fsync ADD PROJECTION q (SELECT id, key ORDER BY key)")
+    node.query("ALTER TABLE t_fsync MATERIALIZE PROJECTION q SETTINGS mutations_sync = 2")
+    node.query("SYSTEM START MERGES t_fsync")
+    node.query("OPTIMIZE TABLE t_fsync FINAL")
+    name = part_name("t_fsync")
+    node.query(f"ALTER TABLE t_fsync DETACH PART '{name}'")
+    node.query(f"ALTER TABLE t_fsync ATTACH PART '{name}'")
+    node.restart_clickhouse()
+    assert active_parts("t_fsync") == "1"
+    assert broken_projection_parts("t_fsync") == "0"
+    assert int(active_projection_parts("t_fsync")) >= 2
+    assert check_table("t_fsync") == "1"
+
+
+# F6 (NEW): a crash between freeze's sibling and parent copies (commit-last) leaves an owner-less
+# sibling in shadow/. No other cleanup visits that namespace - UNFREEZE must reap it.
+def test_unfreeze_reaps_ownerless_shadow_siblings():
+    setup_table("t_shadow", "projection_storage_format = 'flat'")
+    node.query("ALTER TABLE t_shadow FREEZE WITH NAME 'orph'")
+    owner = node.exec_in_container(
+        [
+            "bash",
+            "-c",
+            "find /var/lib/clickhouse/shadow/orph -type d -name '*_*_*_*' ! -name '*.proj' | head -1",
+        ],
+        privileged=True,
+        user="root",
+    ).strip()
+    assert owner != ""
+    assert path_exists(f"{owner}.p.proj")
+    # simulate the crash window: the sibling was copied, the parent dir was not
+    node.exec_in_container(["bash", "-c", f"rm -rf {owner}"], privileged=True, user="root")
+    node.query("ALTER TABLE t_shadow UNFREEZE WITH NAME 'orph'")
+    assert node.contains_in_log("Removing frozen projection sibling")
+    leftovers = node.exec_in_container(
+        ["bash", "-c", "find /var/lib/clickhouse/shadow/orph -name '*.proj' 2>/dev/null | wc -l"],
+        privileged=True,
+        user="root",
+    ).strip()
+    assert leftovers == "0"
+    # the live table is untouched (shadow content was hardlinked)
+    assert check_table("t_shadow") == "1"
+    assert proj_query("t_shadow", extra_settings="force_optimize_projection = 1") != ""
+
+
+# F6 (NEW): the owner-less reap respects the partition matcher - UNFREEZE PARTITION must only
+# touch orphan siblings of the matched partition.
+def test_unfreeze_partition_scopes_ownerless_reap():
+    node.query("DROP TABLE IF EXISTS t_shadow2 SYNC")
+    node.query("SYSTEM STOP MERGES")
+    node.query(
+        """CREATE TABLE t_shadow2 (key UInt64, id UInt64, value String,
+           PROJECTION p (SELECT key, id ORDER BY id))
+           ENGINE = MergeTree PARTITION BY key % 2 ORDER BY key
+           SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat'"""
+    )
+    node.query(
+        "INSERT INTO t_shadow2 SELECT number, number * 2, toString(number) FROM numbers(1000)"
+    )
+    node.query("ALTER TABLE t_shadow2 FREEZE WITH NAME 'orph2'")
+    owner0 = node.exec_in_container(
+        [
+            "bash",
+            "-c",
+            "find /var/lib/clickhouse/shadow/orph2 -type d -name '0_*' ! -name '*.proj' | head -1",
+        ],
+        privileged=True,
+        user="root",
+    ).strip()
+    assert owner0 != ""
+    node.exec_in_container(["bash", "-c", f"rm -rf {owner0}"], privileged=True, user="root")
+
+    def orphan_sibling_count():
+        return node.exec_in_container(
+            ["bash", "-c", "find /var/lib/clickhouse/shadow/orph2 -name '0_*.proj' 2>/dev/null | wc -l"],
+            privileged=True,
+            user="root",
+        ).strip()
+
+    # unfreezing the OTHER partition must not touch partition 0's orphan sibling
+    node.query("ALTER TABLE t_shadow2 UNFREEZE PARTITION 1 WITH NAME 'orph2'")
+    assert orphan_sibling_count() == "1"
+    node.query("ALTER TABLE t_shadow2 UNFREEZE PARTITION 0 WITH NAME 'orph2'")
+    assert orphan_sibling_count() == "0"
+    assert check_table("t_shadow2") == "1"
 
 
 # --- Crash-window recovery coverage (planted states, both rename directions) ---
