@@ -19,15 +19,17 @@
 #include <Poco/JSON/Object.h>
 
 
-#if USE_AVRO && USE_PARQUET
+#if USE_PARQUET
 
 #include <Core/Settings.h>
 
 #include <Databases/DatabaseFactory.h>
 #include <Databases/DataLake/UnityCatalog.h>
+#if USE_AVRO
 #include <Databases/DataLake/RestCatalog.h>
-#include <Databases/DataLake/GlueCatalog.h>
 #include <Databases/DataLake/PaimonRestCatalog.h>
+#endif
+#include <Databases/DataLake/GlueCatalog.h>
 #include <Databases/DataLake/DuckLakeCatalog.h>
 #include <DataTypes/DataTypeString.h>
 
@@ -249,6 +251,7 @@ void DatabaseDataLake::initialize() const
     {
         case DB::DatabaseDataLakeCatalogType::ICEBERG_REST:
         {
+#if USE_AVRO
             catalog_impl = std::make_shared<DataLake::RestCatalog>(
                 settings[DatabaseDataLakeSetting::warehouse].value,
                 url,
@@ -259,9 +262,13 @@ void DatabaseDataLake::initialize() const
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
                 Context::getGlobalContextInstance());
             break;
+#else
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "Cannot use Iceberg REST catalog: ClickHouse was compiled without Avro support");
+#endif
         }
         case DB::DatabaseDataLakeCatalogType::ICEBERG_DELTA_SHARING:
         {
+#if USE_AVRO
             /// Databricks Delta Sharing speaks plain Iceberg REST; it differs only in having flat
             /// (single-level) namespaces, which `DeltaSharingCatalog` reports via its catalog type.
             catalog_impl = std::make_shared<DataLake::DeltaSharingCatalog>(
@@ -274,9 +281,13 @@ void DatabaseDataLake::initialize() const
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
                 Context::getGlobalContextInstance());
             break;
+#else
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "Cannot use Delta Sharing catalog: ClickHouse was compiled without Avro support");
+#endif
         }
         case DB::DatabaseDataLakeCatalogType::ICEBERG_ONELAKE:
         {
+#if USE_AVRO
             catalog_impl = std::make_shared<DataLake::OneLakeCatalog>(
                 settings[DatabaseDataLakeSetting::warehouse].value,
                 url,
@@ -289,9 +300,13 @@ void DatabaseDataLake::initialize() const
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
                 Context::getGlobalContextInstance());
             break;
+#else
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "Cannot use OneLake catalog: ClickHouse was compiled without Avro support");
+#endif
         }
         case DB::DatabaseDataLakeCatalogType::ICEBERG_BIGLAKE:
-        {
+         {
+#if USE_AVRO
             std::string google_project_id = settings[DatabaseDataLakeSetting::google_project_id].value;
             std::string google_service_account = settings[DatabaseDataLakeSetting::google_service_account].value;
             std::string google_metadata_service = settings[DatabaseDataLakeSetting::google_metadata_service].value;
@@ -320,6 +335,9 @@ void DatabaseDataLake::initialize() const
                 Context::getGlobalContextInstance(),
                 allow_server_credentials_in_user_queries);
             break;
+#else
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "Cannot use BigLake catalog: ClickHouse was compiled without Avro support");
+#endif
         }
         case DB::DatabaseDataLakeCatalogType::UNITY:
         {
@@ -374,6 +392,7 @@ void DatabaseDataLake::initialize() const
         }
         case DB::DatabaseDataLakeCatalogType::PAIMON_REST:
         {
+#if USE_AVRO
             if (!settings[DatabaseDataLakeSetting::catalog_credential].value.empty())
             {
                 catalog_impl = std::make_shared<DataLake::PaimonRestCatalog>(
@@ -399,6 +418,9 @@ void DatabaseDataLake::initialize() const
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "Paimon catalog requires either catalog_credential or (dlf_access_key_id, dlf_access_key_secret and region)");
             }
             break;
+#else
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "Cannot use Paimon REST catalog: ClickHouse was compiled without Avro support");
+#endif
         }
     }
 }
@@ -464,6 +486,7 @@ std::shared_ptr<StorageObjectStorageConfiguration> DatabaseDataLake::getConfigur
     auto catalog = getCatalog();
     switch (catalog->getCatalogType())
     {
+#if USE_AVRO
         case DatabaseDataLakeCatalogType::ICEBERG_ONELAKE:
         {
             switch (type)
@@ -625,6 +648,21 @@ std::shared_ptr<StorageObjectStorageConfiguration> DatabaseDataLake::getConfigur
 #endif
             }
         }
+#else
+        /// These catalog types are unreachable without Avro (their creation already threw),
+        /// but the switch must still cover them to compile.
+        case DatabaseDataLakeCatalogType::ICEBERG_ONELAKE:
+        case DatabaseDataLakeCatalogType::ICEBERG_HIVE:
+        case DatabaseDataLakeCatalogType::ICEBERG_REST:
+        case DatabaseDataLakeCatalogType::ICEBERG_BIGLAKE:
+        case DatabaseDataLakeCatalogType::ICEBERG_DELTA_SHARING:
+        case DatabaseDataLakeCatalogType::GLUE:
+        case DatabaseDataLakeCatalogType::PAIMON_REST:
+        {
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                            "This catalog type requires Avro support: ClickHouse was compiled without Avro");
+        }
+#endif
         case DatabaseDataLakeCatalogType::DUCKLAKE:
         {
             switch (type)
@@ -854,7 +892,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
 
     if (catalog->getCatalogType() == DatabaseDataLakeCatalogType::ICEBERG_ONELAKE)
     {
-#if USE_AZURE_BLOB_STORAGE
+#if USE_AZURE_BLOB_STORAGE && USE_AVRO
         auto azure_configuration = std::static_pointer_cast<StorageAzureIcebergConfiguration>(configuration);
         if (!azure_configuration)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Configuration is not azure type for one lake catalog");
@@ -876,7 +914,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
 
     if (catalog->getCatalogType() == DatabaseDataLakeCatalogType::ICEBERG_BIGLAKE)
     {
-#if USE_AWS_S3
+#if USE_AWS_S3 && USE_AVRO
         auto s3_configuration = std::dynamic_pointer_cast<StorageS3Configuration>(configuration);
         if (!s3_configuration)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Configuration is not S3 type for BigLake catalog");
