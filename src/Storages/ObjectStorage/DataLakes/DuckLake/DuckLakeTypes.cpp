@@ -4,6 +4,7 @@
 #include <DataTypes/DataTypeDate.h>
 #include <DataTypes/DataTypeDate32.h>
 #include <DataTypes/DataTypeDateTime64.h>
+#include <DataTypes/DataTypeDynamic.h>
 #include <DataTypes/DataTypesDecimal.h>
 #include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeNullable.h>
@@ -89,6 +90,11 @@ DataTypePtr parseScalarType(const String & type_text)
     if (type == "uuid")
         return std::make_shared<DataTypeUUID>();
 
+    /// DuckLake `variant` columns are stored as Parquet VARIANT groups, which the Parquet
+    /// reader decodes into the ClickHouse Dynamic type.
+    if (type == "variant")
+        return std::make_shared<DataTypeDynamic>();
+
     if (type.starts_with("decimal(") && type.ends_with(')'))
     {
         const String inner = type.substr(8, type.size() - 9);
@@ -109,7 +115,7 @@ DataTypePtr parseScalarType(const String & type_text)
             type_text);
     }
 
-    if (type == "timetz" || type == "interval" || type == "variant" || type == "geometry" || type == "unknown")
+    if (type == "timetz" || type == "interval" || type == "geometry" || type == "unknown")
         throw Exception(
             ErrorCodes::SUPPORT_IS_DISABLED,
             "DuckLake column type '{}' is not supported by the ClickHouse DuckLake integration",
