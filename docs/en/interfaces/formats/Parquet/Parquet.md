@@ -54,6 +54,19 @@ The table below shows how Parquet data types match ClickHouse [data types](/sql-
 | `MultiLineString` (GeoParquet) | [MultiLineString](/sql-reference/data-types/geo.md#multilinestring) |
 | `MultiPolygon` (GeoParquet) | [MultiPolygon](/sql-reference/data-types/geo.md#multipolygon) |
 | mixed/unknown geometry (GeoParquet) | [Geometry](/sql-reference/data-types/geo.md#geometry) |
+| `VARIANT` | [Dynamic](/sql-reference/data-types/dynamic.md) |
+
+## Parquet VARIANT columns {#parquet-variant-columns}
+
+Groups annotated with the [`VARIANT` logical type](https://github.com/apache/parquet-format/blob/master/VariantEncoding.md) are decoded into [Dynamic](/sql-reference/data-types/dynamic.md), including columns that are [shredded](https://github.com/apache/parquet-format/blob/master/VariantShredding.md): the variant-encoded `value` binaries and the shredded `typed_value` columns are reconstructed per the shredding specification. Each row's value is preserved with its type (objects become `Tuple`s, arrays become `Array(Dynamic)`, scalars keep their primitive type). A Variant that is missing or explicitly null is read as a `Dynamic` null value.
+
+Requesting a `Tuple` type for the column explicitly falls back to reading the raw group structure (e.g. `Tuple(metadata String, value String)`), and requesting `String` produces the JSON text of each value instead. Requesting [JSON](/sql-reference/data-types/newjson.md) also works, but only if all values are JSON objects at the top level, because the `JSON` type cannot hold top-level scalars or arrays. Setting `input_format_parquet_enable_json_parsing` to `0` restores the legacy behavior of reading VARIANT groups as plain tuples during schema inference.
+
+DuckDB writes `VARIANT` columns with a top-level `typed_value (String)` that holds the JSON document of the whole value (rather than a spec-compliant shredding); such values are embedded as-is when the string is a complete JSON document.
+
+When the requested schema declares the column as [JSON](/sql-reference/data-types/newjson.md) and only subcolumns of it are read (e.g. `payload.event_type` or `` payload.event_type.:`String` ``), the reader pushes the path down to the leaf level: if the path maps to a fully-shredded field, only that leaf is read; otherwise only the `metadata` leaf, the leaves of the shredded field group covering the path (or the root `value` leaf for unshredded fields), and the addressed value is extracted per row without assembling the whole value.
+
+On write, [Dynamic](/sql-reference/data-types/dynamic.md) columns are encoded as unshredded Parquet `VARIANT` groups (`required binary metadata` + `required binary value`), with each row's value encoded in the Variant binary encoding (named tuples and maps as objects, arrays and unnamed tuples as arrays, scalars as the corresponding variant primitives; `Dynamic` nulls as Variant nulls). Reading such a file back yields a `Dynamic` column with the same per-row values and types.
 
 When writing Parquet file, data types that don't have a matching Parquet type are converted to the nearest available type:
 
