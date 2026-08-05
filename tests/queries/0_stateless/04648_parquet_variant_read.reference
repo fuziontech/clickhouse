@@ -1,5 +1,5 @@
 -- unshredded variant: schema inference gives Dynamic --
-v	Dynamic					
+v	Dynamic
 -- unshredded variant: values --
 (1,[1,'x'],NULL)	Tuple(a Int64, b Array(Dynamic), c Nullable(String))
 42	Int64

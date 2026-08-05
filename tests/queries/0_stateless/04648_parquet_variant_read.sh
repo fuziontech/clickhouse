@@ -8,7 +8,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # The test files were hand-crafted per the parquet-format VariantEncoding/VariantShredding specs.
 
 echo "-- unshredded variant: schema inference gives Dynamic --"
-$CLICKHOUSE_LOCAL -q "DESCRIBE file('$CUR_DIR/data_parquet/04648_variant_unshredded.parquet')"
+$CLICKHOUSE_LOCAL -q "DESCRIBE file('$CUR_DIR/data_parquet/04648_variant_unshredded.parquet')" | cut -f1,2
 
 echo "-- unshredded variant: values --"
 $CLICKHOUSE_LOCAL -q "SELECT v, dynamicType(v) FROM file('$CUR_DIR/data_parquet/04648_variant_unshredded.parquet')"
