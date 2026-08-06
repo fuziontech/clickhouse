@@ -71,6 +71,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"input_format_parquet_spatial_filter_push_down", false, true, "New setting: skip GeoParquet row groups and pages based on spatial predicates and bounding box statistics"},
             {"use_text_index_negative_tokens_cache", false, true, "New setting to cache absent text index tokens and avoid repeated dictionary lookups."},
             {"allow_insert_into_ducklake", false, false, "New setting."},
+            {"allow_experimental_database_ducklake_catalog", false, false, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "26.7",
         {
