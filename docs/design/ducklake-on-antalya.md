@@ -67,3 +67,21 @@ Phase order is chosen so each phase is independently deployable.
 1. Target `antalya-26.3` (PostHog's deployed line) or `antalya-26.4`?
 2. Where does the fork + image CI live (fuziontech/clickhouse has no antalya packaging pipeline; a PostHog-owned fork of Altinity/ClickHouse with a packaging workflow is the clean option)?
 3. Who operates the swarm if phase 4 happens (new pool in the mw cluster vs reuse)?
+
+## Decisions (2026-08-15) and port status
+
+Decided with the repo owner:
+
+- **Target line: `antalya-26.4` or newer** (no need to match the prod-deployed 26.3 exactly).
+- **Home: `PostHog/clickhouse`** (fork of Altinity/ClickHouse, created for this work). Images to GHCR unless PostHog ECR turns out easier.
+- **Design for swarm from the start**, but swarm enablement does not have to land in the first PR.
+
+Port progress:
+
+- `port/ducklake-read-antalya-26.4` on PostHog/clickhouse: the full read-core stack cherry-picked onto `antalya-26.4` (9 commits) plus one adaptation commit (`b5ed66e`). Notable port work beyond plain conflict resolution:
+  - backported the stripped-filter / fallback `FilterTransform` machinery into `StorageObjectStorageSource.cpp` (present in antalya-26.3, absent in the June 26.4 cut);
+  - `ICatalog` interface on 26.4 is the older `DB::Names getTables()` shape;
+  - 2-arg `ActionsDAGWithInversionPushDown`, no `ObjectInfo::getFileSizeHint`, no `ColumnConstPtr` alias, no `current_schema_column_mapper` on 26.4.
+- Builds clean (clang-21, RelWithDebInfo); 13/13 DuckLake gtests pass; local smoke over the sqlite fixture catalog passes: table enumeration, plain/nested/types reads, positional deletes, schema evolution.
+- Remaining before image: full docker integration suite (`test_ducklake_catalog`), then VARIANT + write stacks, then the swarm snapshot-propagation item from phase 4.
+
