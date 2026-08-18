@@ -446,3 +446,87 @@ def test_unsupported_catalog_version(started_cluster):
             " ducklake_connection_string = 'catalog_badversion.db';",
             settings={"allow_experimental_database_ducklake_catalog": 1},
         )
+
+
+def test_ducklake_read_during_concurrent_commits(started_cluster):
+    """A query must observe one consistent catalog snapshot even while another writer
+    commits (compaction/flush advancing ducklake_snapshot). The catalog read now runs
+    inside one REPEATABLE READ transaction (DuckLakeCatalog.beginSnapshotRead); before
+    that, a commit landing between the listing's autocommit statements aborted the query
+    with "DuckLake catalog changed while reading table metadata" whenever the table had
+    an inlined delete table, and a flush physically removing inlined rows mid-read could
+    resurrect deleted rows / lose flushed ones.
+
+    The inlined delete table below is fabricated to match DuckDB's
+    ducklake_inlined_delete_<table_id> shape; the old failure mode only engaged when it
+    existed. The mutator advances the snapshot and churns the inlined delete table
+    without touching data files, so the visible row count must stay constant throughout.
+    This test is a stress check (it cannot deterministically place a commit between two
+    reader statements), so it asserts the property that must hold for ANY interleaving:
+    reads never fail and never observe a torn snapshot.
+    """
+    import threading
+
+    create_postgres_db()
+    db = "ducklake_pg"
+    base = int(node.query("SELECT count() FROM `main.plain`", database=db))
+
+    postgres_container_id = cluster.get_instance_docker_id("postgres1")
+
+    def psql(sql):
+        run_and_check(
+            [f'docker exec {postgres_container_id} psql -U postgres -d postgres -v ON_ERROR_STOP=1 -c "{sql}"'],
+            shell=True,
+        )
+
+    table_id = int(
+        run_and_check(
+            [
+                f"docker exec {postgres_container_id} psql -U postgres -d postgres -t -A -c "
+                f"\"SELECT table_id FROM ducklake_table WHERE table_name = 'plain' AND end_snapshot IS NULL\""
+            ],
+            shell=True,
+        ).strip()
+    )
+    psql(
+        f"CREATE TABLE IF NOT EXISTS ducklake_inlined_delete_{table_id} "
+        f"(file_id BIGINT, row_id BIGINT, begin_snapshot BIGINT)"
+    )
+
+    errors = []
+    stop = threading.Event()
+
+    def reader():
+        while not stop.is_set():
+            try:
+                count = int(node.query("SELECT count() FROM `main.plain`", database=db))
+                assert count == base, f"torn snapshot observed: count {count} != {base}"
+            except Exception as e:
+                errors.append(e)
+
+    def mutator():
+        # Each commit advances the snapshot and churns the inlined delete table, like a
+        # delete flush does (physically removing rows a reader at the old snapshot needs).
+        for i in range(60):
+            psql(
+                f"WITH s AS (SELECT MAX(snapshot_id) + 1 AS next_id, MAX(schema_version) AS sv, "
+                f"MAX(next_catalog_id) AS nc, MAX(next_file_id) AS nf FROM ducklake_snapshot) "
+                f"INSERT INTO ducklake_snapshot SELECT next_id, now(), sv, nc, nf FROM s"
+            )
+            psql(
+                f"INSERT INTO ducklake_inlined_delete_{table_id} VALUES (0, {i}, 0); "
+                f"DELETE FROM ducklake_inlined_delete_{table_id}"
+            )
+
+    readers = [threading.Thread(target=reader) for _ in range(3)]
+    writer = threading.Thread(target=mutator)
+    for thread in readers:
+        thread.start()
+    writer.start()
+    writer.join()
+    stop.set()
+    for thread in readers:
+        thread.join()
+
+    assert not errors, f"read failures during concurrent commits: {errors[:3]}"
+    assert node.query("SELECT count() FROM `main.plain`", database=db) == f"{base}\n"
