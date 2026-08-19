@@ -7,6 +7,7 @@
 #include <Databases/DataLake/DuckLakeCatalog.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <Formats/FormatSettings.h>
+#include <Core/Settings.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/ExpressionActions.h>
@@ -31,6 +32,11 @@ namespace DataLakeStorageSetting
 extern const DataLakeStorageSettingsString ducklake_schema_name;
 extern const DataLakeStorageSettingsString ducklake_table_name;
 extern const DataLakeStorageSettingsString ducklake_database_name;
+}
+
+namespace Setting
+{
+extern const SettingsInt64 ducklake_snapshot_id;
 }
 
 namespace ErrorCodes
@@ -269,7 +275,26 @@ DataLakeMetadataPtr DuckLakeMetadata::create(
     /// Hold one catalog snapshot transaction for the whole query: the pin, the schema
     /// read, and the later file listing + inlined reads all observe the same snapshot,
     /// even if a flush physically removes inlined rows mid-query.
-    auto snapshot_read = catalog->beginSnapshotRead();
+    ///
+    /// The ducklake_snapshot_id setting pins the snapshot explicitly: set by the
+    /// initiator of a parallel-replicas query (propagated to secondaries with the query
+    /// settings) or by the user for time travel. When it is unset, pin the latest
+    /// snapshot and write it back into the query settings — every later catalog read of
+    /// this query (and every replica of it) then observes the same snapshot.
+    /// Read and stamp through the query context: the first DuckLake table of a query pins
+    /// the snapshot for every other DuckLake table of the same query (and every replica).
+    const ContextPtr & settings_context = local_context->hasQueryContext() ? local_context->getQueryContext() : local_context;
+    const Int64 forced_snapshot = settings_context->getSettingsRef()[Setting::ducklake_snapshot_id];
+    auto snapshot_read = forced_snapshot > 0 ? catalog->beginSnapshotReadAt(forced_snapshot) : catalog->beginSnapshotRead();
+    if (forced_snapshot == 0 && snapshot_read->snapshot_id > 0 && local_context->hasQueryContext())
+    {
+        local_context->getQueryContext()->setSetting("ducklake_snapshot_id", Field(snapshot_read->snapshot_id));
+        LOG_DEBUG(
+            getLogger("DuckLakeMetadata"),
+            "DuckLake: pinned catalog snapshot {} for this query (propagated to parallel replicas)",
+            snapshot_read->snapshot_id);
+    }
+
     auto info = catalog->getTableSnapshotInfo(*snapshot_read->conn, schema_name, table_name, snapshot_read->snapshot_id);
 
     auto column_mapper = std::make_shared<ColumnMapper>();

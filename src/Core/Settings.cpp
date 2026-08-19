@@ -7699,6 +7699,11 @@ Query Iceberg table using the snapshot that was current at a specific timestamp.
     DECLARE(Int64, iceberg_snapshot_id, 0, R"(
 Query Iceberg table using the specific snapshot id.
 )", 0) \
+    DECLARE(Int64, ducklake_snapshot_id, 0, R"(
+Query DuckLake table(s) using the specific catalog snapshot id (0 = latest). The initiator
+node of a parallel-replicas query sets this automatically to the snapshot it pinned, so every
+replica reads the same catalog snapshot; it can also be set explicitly for time travel.
+)", 0) \
     DECLARE(Bool, allow_experimental_geo_types_in_iceberg, false, R"(
 Allow parsing Iceberg `geometry` and `geography` field types as ClickHouse `Geometry` (Variant) type.
 )", 0) \

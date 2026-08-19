@@ -530,3 +530,40 @@ def test_ducklake_read_during_concurrent_commits(started_cluster):
 
     assert not errors, f"read failures during concurrent commits: {errors[:3]}"
     assert node.query("SELECT count() FROM `main.plain`", database=db) == f"{base}\n"
+
+
+def test_ducklake_snapshot_id_time_travel(started_cluster):
+    """ducklake_snapshot_id pins the catalog snapshot explicitly (the same code path a
+    parallel-replicas secondary uses to follow the initiator's pinned snapshot): reading
+    main.evolved at an older snapshot must return only the files visible then (2 rows at
+    snapshot 9, 5 at the latest snapshot 17)."""
+    create_postgres_db()
+    db = "ducklake_pg"
+
+    assert node.query("SELECT count() FROM `main.evolved`", database=db) == "5\n"
+    assert (
+        node.query(
+            "SELECT count() FROM `main.evolved`",
+            database=db,
+            settings={"ducklake_snapshot_id": 9},
+        )
+        == "2\n"
+    )
+    assert (
+        node.query(
+            "SELECT count() FROM `main.evolved`",
+            database=db,
+            settings={"ducklake_snapshot_id": 11},
+        )
+        == "3\n"
+    )
+
+
+def test_ducklake_snapshot_id_propagation_stamp(started_cluster):
+    """After reading a DuckLake table without an explicit snapshot, the pinned
+    ducklake_snapshot_id is stamped into the query settings (logged at pin time) — that
+    stamp is what a parallel-replicas query ships to secondaries so all nodes read one
+    catalog snapshot."""
+    create_postgres_db()
+    node.query("SELECT count() FROM `main.plain`", database="ducklake_pg")
+    assert node.grep_in_log("DuckLake: pinned catalog snapshot")

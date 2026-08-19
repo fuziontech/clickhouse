@@ -533,6 +533,14 @@ std::shared_ptr<DuckLakeCatalog::SnapshotRead> DuckLakeCatalog::beginSnapshotRea
     return read;
 }
 
+std::shared_ptr<DuckLakeCatalog::SnapshotRead> DuckLakeCatalog::beginSnapshotReadAt(Int64 snapshot_id) const
+{
+    auto read = std::make_shared<SnapshotRead>();
+    read->conn = connection->beginReadTx();
+    read->snapshot_id = snapshot_id;
+    return read;
+}
+
 bool DuckLakeCatalog::empty() const
 {
     return getTables().empty();
