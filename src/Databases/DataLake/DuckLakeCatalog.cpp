@@ -715,7 +715,7 @@ DuckLakeTableSnapshotInfo DuckLakeCatalog::getTableSnapshotInfo(IDuckLakeConnect
     };
 }
 
-DuckLakeFileListing DuckLakeCatalog::getDataFiles(IDuckLakeConnection & conn, Int64 table_id, Int64 snapshot_id) const
+DuckLakeFileListing DuckLakeCatalog::getDataFiles(IDuckLakeConnection & conn, Int64 table_id, Int64 snapshot_id, const DuckLakeListingOptions & options) const
 {
     DuckLakeFileListing listing;
 
@@ -806,59 +806,97 @@ DuckLakeFileListing DuckLakeCatalog::getDataFiles(IDuckLakeConnection & conn, In
     /// ("invalid memory alloc request size 1073741824"), which is exactly the catalog scale
     /// this scoping exists for. 100k ids per batch keeps each statement ~1MB.
     static constexpr size_t ducklake_stats_id_batch = 100000;
-    for (size_t batch_begin = 0; batch_begin < listing.files.size(); batch_begin += ducklake_stats_id_batch)
+
+    /// Stats are read only for the columns the caller can prune on; a caller with no
+    /// min/max-usable filter skips this read entirely (the side table holds ~10^8 rows
+    /// on a busy catalog, and fetching it dominates the listing cost there).
+    if (!options.stats_column_ids.has_value() || !options.stats_column_ids->empty())
     {
-        const size_t batch_end = std::min(batch_begin + ducklake_stats_id_batch, listing.files.size());
-        String batch_ids = "(";
-        for (size_t i = batch_begin; i < batch_end; ++i)
+        String column_filter;
+        if (options.stats_column_ids.has_value())
         {
-            if (i > batch_begin)
-                batch_ids += ',';
-            batch_ids += std::to_string(listing.files[i].data_file_id);
-        }
-        batch_ids += ")";
-
-        const auto stats = conn.exec(fmt::format(
-            "SELECT data_file_id, column_id, value_count, null_count, contains_nan, min_value, max_value "
-            "FROM {} WHERE table_id = {} AND data_file_id IN {}",
-            conn.qualified("ducklake_file_column_stats"),
-            table_id,
-            batch_ids));
-        for (const auto & row : stats.rows)
-        {
-            const Int64 data_file_id = parseInt64(row[0], "data_file_id");
-            auto it = std::lower_bound(
-                listing.files.begin(), listing.files.end(), data_file_id,
-                [](const DuckLakeDataFileEntry & entry, Int64 id) { return entry.data_file_id < id; });
-            if (it == listing.files.end() || it->data_file_id != data_file_id)
-                continue;
-            it->column_stats.push_back(DuckLakeFileColumnStats{
-                .column_id = parseInt64(row[1], "column_id"),
-                .value_count = row[2].has_value() ? std::stoll(*row[2]) : 0,
-                .null_count = row[3].has_value() ? std::stoll(*row[3]) : 0,
-                .contains_nan = parseBool(row[4]),
-                .min_value = row[5],
-                .max_value = row[6],
-            });
+            column_filter = " AND column_id IN (";
+            for (size_t i = 0; i < options.stats_column_ids->size(); ++i)
+            {
+                if (i > 0)
+                    column_filter += ',';
+                column_filter += std::to_string((*options.stats_column_ids)[i]);
+            }
+            column_filter += ")";
         }
 
-        const auto partition_values = conn.exec(fmt::format(
-            "SELECT data_file_id, partition_key_index, partition_value FROM {} WHERE table_id = {} AND data_file_id IN {}",
-            conn.qualified("ducklake_file_partition_value"),
-            table_id,
-            batch_ids));
-        for (const auto & row : partition_values.rows)
+        for (size_t batch_begin = 0; batch_begin < listing.files.size(); batch_begin += ducklake_stats_id_batch)
         {
-            const Int64 data_file_id = parseInt64(row[0], "data_file_id");
-            const auto partition_key_index = static_cast<size_t>(parseInt64(row[1], "partition_key_index"));
-            auto it = std::lower_bound(
-                listing.files.begin(), listing.files.end(), data_file_id,
-                [](const DuckLakeDataFileEntry & entry, Int64 id) { return entry.data_file_id < id; });
-            if (it == listing.files.end() || it->data_file_id != data_file_id)
-                continue;
-            if (it->partition_values.size() <= partition_key_index)
-                it->partition_values.resize(partition_key_index + 1);
-            it->partition_values[partition_key_index] = row[2];
+            const size_t batch_end = std::min(batch_begin + ducklake_stats_id_batch, listing.files.size());
+            String batch_ids = "(";
+            for (size_t i = batch_begin; i < batch_end; ++i)
+            {
+                if (i > batch_begin)
+                    batch_ids += ',';
+                batch_ids += std::to_string(listing.files[i].data_file_id);
+            }
+            batch_ids += ")";
+
+            const auto stats = conn.exec(fmt::format(
+                "SELECT data_file_id, column_id, value_count, null_count, contains_nan, min_value, max_value "
+                "FROM {} WHERE table_id = {} AND data_file_id IN {}{}",
+                conn.qualified("ducklake_file_column_stats"),
+                table_id,
+                batch_ids,
+                column_filter));
+            for (const auto & row : stats.rows)
+            {
+                const Int64 data_file_id = parseInt64(row[0], "data_file_id");
+                auto it = std::lower_bound(
+                    listing.files.begin(), listing.files.end(), data_file_id,
+                    [](const DuckLakeDataFileEntry & entry, Int64 id) { return entry.data_file_id < id; });
+                if (it == listing.files.end() || it->data_file_id != data_file_id)
+                    continue;
+                it->column_stats.push_back(DuckLakeFileColumnStats{
+                    .column_id = parseInt64(row[1], "column_id"),
+                    .value_count = row[2].has_value() ? std::stoll(*row[2]) : 0,
+                    .null_count = row[3].has_value() ? std::stoll(*row[3]) : 0,
+                    .contains_nan = parseBool(row[4]),
+                    .min_value = row[5],
+                    .max_value = row[6],
+                });
+            }
+        }
+    }
+
+    /// Partition values feed only partition pruning; an unfiltered scan skips this read.
+    if (options.fetch_partition_values)
+    {
+        for (size_t batch_begin = 0; batch_begin < listing.files.size(); batch_begin += ducklake_stats_id_batch)
+        {
+            const size_t batch_end = std::min(batch_begin + ducklake_stats_id_batch, listing.files.size());
+            String batch_ids = "(";
+            for (size_t i = batch_begin; i < batch_end; ++i)
+            {
+                if (i > batch_begin)
+                    batch_ids += ',';
+                batch_ids += std::to_string(listing.files[i].data_file_id);
+            }
+            batch_ids += ")";
+
+            const auto partition_values = conn.exec(fmt::format(
+                "SELECT data_file_id, partition_key_index, partition_value FROM {} WHERE table_id = {} AND data_file_id IN {}",
+                conn.qualified("ducklake_file_partition_value"),
+                table_id,
+                batch_ids));
+            for (const auto & row : partition_values.rows)
+            {
+                const Int64 data_file_id = parseInt64(row[0], "data_file_id");
+                const auto partition_key_index = static_cast<size_t>(parseInt64(row[1], "partition_key_index"));
+                auto it = std::lower_bound(
+                    listing.files.begin(), listing.files.end(), data_file_id,
+                    [](const DuckLakeDataFileEntry & entry, Int64 id) { return entry.data_file_id < id; });
+                if (it == listing.files.end() || it->data_file_id != data_file_id)
+                    continue;
+                if (it->partition_values.size() <= partition_key_index)
+                    it->partition_values.resize(partition_key_index + 1);
+                it->partition_values[partition_key_index] = row[2];
+            }
         }
     }
 
