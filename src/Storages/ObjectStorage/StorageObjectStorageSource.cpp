@@ -44,6 +44,10 @@
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
 #include <Storages/ObjectStorage/DataLakes/DeletionVectorTransform.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataObjectInfo.h>
+#include <Storages/ObjectStorage/DataLakes/DuckLake/DuckLakeDataObjectInfo.h>
+#include <Storages/ObjectStorage/DataLakes/DuckLake/DuckLakeInlinedDataSource.h>
+#include <Processors/Chunk.h>
+#include <Storages/ObjectStorage/DataLakes/DuckLake/DuckLakeMetadata.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Storages/ObjectStorage/Utils.h>
@@ -845,6 +849,95 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
         if (!object_info || object_info->getPath().empty())
             return {};
+
+        /// Count-only on a DuckLake file: the catalog already carried its exact record
+        /// count and delete counts in the listing/task — answer without opening the
+        /// parquet footer (a full-table count over a big catalog is otherwise one S3
+        /// range read per file).
+        if (need_only_count)
+        {
+            if (const auto * ducklake_object = dynamic_cast<DuckLakeDataObjectInfo *>(object_info.get());
+                ducklake_object && ducklake_object->inlined_table_name.empty() && ducklake_object->record_count.has_value())
+            {
+                Int64 count = *ducklake_object->record_count;
+                for (const auto & delete_file : ducklake_object->positional_delete_files)
+                    count -= delete_file.delete_count;
+                count -= static_cast<Int64>(ducklake_object->inlined_deleted_positions.size());
+                if (count < 0)
+                    count = 0;
+
+                /// Tasks arriving from another replica carry no object metadata (files
+                /// re-fetch it lazily, which this path deliberately skips).
+                if (!object_info->getObjectMetadata())
+                {
+                    ObjectMetadata placeholder_metadata;
+                    placeholder_metadata.size_bytes = 0;
+                    placeholder_metadata.is_size_known = true;
+                    object_info->setObjectMetadata(placeholder_metadata);
+                }
+
+                LOG_DEBUG(
+                    log,
+                    "DuckLake: answering count for file '{}' from catalog record count ({} rows), skipping footer read",
+                    object_info->getPath(),
+                    count);
+
+                std::vector<Chunk> chunks;
+                if (!read_from_format_info.source_header.getColumns().empty())
+                    chunks.push_back(cloneConstWithDefault(
+                        Chunk{read_from_format_info.source_header.getColumns(), 0}, static_cast<UInt64>(count)));
+                else
+                    chunks.emplace_back(Columns{}, static_cast<UInt64>(count));
+                auto source = std::make_shared<DuckLakeInlinedDataSource>(
+                    std::make_shared<const Block>(read_from_format_info.source_header), std::move(chunks));
+                Pipe pipe(source);
+                auto pipeline = std::make_unique<QueryPipeline>(std::move(pipe));
+                auto pulling = std::make_unique<PullingPipelineExecutor>(*pipeline);
+                return ReaderHolder(object_info, nullptr, std::move(source), std::move(pipeline), std::move(pulling));
+            }
+        }
+
+        /// A synthetic DuckLake inlined-data object is not a file: read its rows from
+        /// the catalog (via the lake metadata at the pinned snapshot) instead of
+        /// opening an object-storage path.
+        if (auto * ducklake_object = dynamic_cast<DuckLakeDataObjectInfo *>(object_info.get());
+            ducklake_object && !ducklake_object->inlined_table_name.empty())
+        {
+            auto * ducklake_metadata = dynamic_cast<DuckLakeMetadata *>(configuration->getExternalMetadata());
+            if (!ducklake_metadata)
+                throw Exception(
+                    ErrorCodes::LOGICAL_ERROR,
+                    "DuckLake inlined object '{}' on a non-DuckLake configuration",
+                    ducklake_object->inlined_table_name);
+
+            /// Tasks arriving from another replica carry no object metadata (files
+            /// re-fetch it lazily, which would fail for the synthetic path).
+            if (!object_info->getObjectMetadata())
+            {
+                ObjectMetadata placeholder_metadata;
+                placeholder_metadata.size_bytes = 0;
+                placeholder_metadata.is_size_known = true;
+                object_info->setObjectMetadata(placeholder_metadata);
+            }
+
+            std::optional<UInt64> count_only;
+            if (need_only_count && ducklake_object->record_count.has_value())
+                count_only = static_cast<UInt64>(*ducklake_object->record_count);
+
+            auto pipe = ducklake_metadata->createInlinedDataPipe(
+                ducklake_object->inlined_table_name,
+                ducklake_object->inlined_schema_version,
+                read_from_format_info,
+                context_,
+                max_block_size,
+                count_only);
+
+            auto source = pipe.getProcessors().empty() ? nullptr : std::dynamic_pointer_cast<ISource>(pipe.getProcessors().front());
+            auto pipeline = std::make_unique<QueryPipeline>(std::move(pipe));
+            auto pulling = std::make_unique<PullingPipelineExecutor>(*pipeline);
+            return ReaderHolder(object_info, nullptr, std::move(source), std::move(pipeline), std::move(pulling));
+        }
+
         if (!object_info->getObjectMetadata())
         {
             bool with_tags = read_from_format_info.requested_virtual_columns.contains("_tags");
@@ -1033,8 +1126,13 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             const bool format_supports_prewhere =
                 FormatFactory::instance().checkIfFormatSupportsPrewhere(actual_format, context_, format_settings);
 
+            /// The data lake can require post-read filters for a file (e.g. DuckLake hive
+            /// partition constants are only materialized after reading).
+            const bool strip_filters = !format_supports_prewhere
+                || (object_info->data_lake_metadata && object_info->data_lake_metadata->force_post_read_filters);
+
             /// Save filters for fallback FilterTransform when format doesn't support PREWHERE.
-            if (!format_supports_prewhere)
+            if (strip_filters)
             {
                 if (format_filter_info->row_level_filter)
                     stripped_row_level_filter = format_filter_info->row_level_filter;
@@ -1059,14 +1157,14 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                     /// Parquet row-group / page pruning.
                     const bool has_schema_transform
                         = configuration->getSchemaTransformer(context_, object_info) != nullptr;
-                    if (format_supports_prewhere && has_schema_transform)
+                    if (!strip_filters && has_schema_transform)
                     {
                         if (format_filter_info->row_level_filter)
                             stripped_row_level_filter = format_filter_info->row_level_filter;
                         if (format_filter_info->prewhere_info)
                             stripped_prewhere_info = format_filter_info->prewhere_info;
                     }
-                    const bool keep_in_reader = format_supports_prewhere && !has_schema_transform;
+                    const bool keep_in_reader = !strip_filters && !has_schema_transform;
                     auto result = std::make_shared<FormatFilterInfo>(
                         format_filter_info->filter_actions_dag, format_filter_info->context.lock(),
                         mapper,
@@ -1082,12 +1180,35 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                 }
             }
 
-            if (!format_supports_prewhere)
+            if (strip_filters)
+            {
+                /// Data lake files can carry their own ColumnMapper (e.g. DuckLake
+                /// name-mapped files matched by column name); prefer it over the
+                /// table-wide one.
+                if (auto object_mapper = configuration->getColumnMapperForObject(object_info))
+                    return std::make_shared<FormatFilterInfo>(
+                        format_filter_info->filter_actions_dag,
+                        format_filter_info->context.lock(),
+                        object_mapper,
+                        nullptr, nullptr);
                 return std::make_shared<FormatFilterInfo>(
                     format_filter_info->filter_actions_dag,
                     format_filter_info->context.lock(),
                     format_filter_info->column_mapper,
                     nullptr, nullptr);
+            }
+
+            /// Data lake files can carry their own ColumnMapper (e.g. DuckLake name-mapped
+            /// files matched by column name); swap it in when it differs from the
+            /// table-wide one.
+            if (auto object_mapper = configuration->getColumnMapperForObject(object_info);
+                object_mapper && object_mapper != format_filter_info->column_mapper)
+                return std::make_shared<FormatFilterInfo>(
+                    format_filter_info->filter_actions_dag,
+                    format_filter_info->context.lock(),
+                    object_mapper,
+                    format_filter_info->row_level_filter,
+                    format_filter_info->prewhere_info);
 
             return format_filter_info;
         }();
@@ -1211,11 +1332,15 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             /// FIXME: This is currently not done for the below case (configuration->getSchemaTransformer())
             /// because it is an iceberg case where transformer contains columns ids (just increasing numbers)
             /// which do not match requested_columns (while here requested_columns were adjusted to match physical columns).
-            Names needed_names = read_from_format_info.requested_columns.getNames();
+            /// The transform produces whole columns, so keep top-level names here:
+            /// removeUnusedActions throws on subcolumn names like `s.x` (extracted later).
+            Names needed_names;
+            for (const auto & requested_column : read_from_format_info.requested_columns)
+                needed_names.push_back(requested_column.name.substr(0, requested_column.name.find('.')));
             auto add_filter_required_names = [&needed_names](const ActionsDAG & dag)
             {
                 for (const auto & required : dag.getRequiredColumns())
-                    needed_names.push_back(required.name);
+                    needed_names.push_back(required.name.substr(0, required.name.find('.')));
             };
             if (stripped_row_level_filter)
                 add_filter_required_names(stripped_row_level_filter->actions);

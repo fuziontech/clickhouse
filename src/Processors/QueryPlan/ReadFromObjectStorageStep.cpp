@@ -4,12 +4,15 @@
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Processors/Sources/NullSource.h>
+#include <Processors/Sources/SourceFromSingleChunk.h>
+#include <Processors/Chunk.h>
 #include <Processors/QueryPlan/Serialization.h>
 #include <IO/WriteHelpers.h>
 #include <IO/ReadHelpers.h>
 #include <IO/Operators.h>
 #include <Storages/ObjectStorage/S3/Configuration.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
+#include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
 #include <Processors/QueryPlan/QueryPlanStepRegistry.h>
 #include <Formats/FormatFactory.h>
@@ -95,6 +98,31 @@ void ReadFromObjectStorageStep::updatePrewhereInfo(const PrewhereInfoPtr & prewh
 
 void ReadFromObjectStorageStep::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
 {
+    /// Unfiltered count(*) on a catalog-backed table: answer from the catalog listing
+    /// (exact record/delete counts at the pinned snapshot) instead of reading every
+    /// file's footer. DuckLake implements this; other data lakes return nullopt and
+    /// take the generic path. LOCAL reads only: in distributed processing this step
+    /// must count just the files the task distributor assigns to it (via the generic
+    /// path) — a full metadata count on every replica would multiply the result.
+    if (need_only_count && !distributed_processing)
+    {
+        if (const auto * data_lake_metadata = configuration->getExternalMetadata())
+        {
+            if (const auto total_count = data_lake_metadata->getTotalCountFromMetadata())
+            {
+                LOG_DEBUG(
+                    getLogger("ReadFromObjectStorageStep"),
+                    "Answering count from catalog metadata ({} rows), skipping file reads",
+                    *total_count);
+                const auto & header = info.source_header;
+                pipeline.init(Pipe(std::make_shared<SourceFromSingleChunk>(
+                    std::make_shared<const Block>(header),
+                    Chunk{cloneConstWithDefault(Chunk{header.getColumns(), 0}, *total_count)})));
+                return;
+            }
+        }
+    }
+
     createIterator();
 
     Pipes pipes;
@@ -139,6 +167,19 @@ void ReadFromObjectStorageStep::initializePipeline(QueryPipelineBuilder & pipeli
 
         pipes.emplace_back(std::move(source));
     }
+
+    /// Data lake metadata can provide additional row sources that are not backed by files
+    /// (e.g. DuckLake inlined data rows stored in the catalog).
+    if (configuration->isDataLakeConfiguration())
+    {
+        if (auto * lake_metadata = configuration->getExternalMetadata())
+        {
+            auto additional_pipe = lake_metadata->getAdditionalReadPipe(info, storage_snapshot->metadata, context, max_block_size);
+            if (!additional_pipe.empty())
+                pipes.emplace_back(std::move(additional_pipe));
+        }
+    }
+
     auto pipe = Pipe::unitePipes(std::move(pipes));
     if (pipe.empty())
         pipe = Pipe(std::make_shared<NullSource>(std::make_shared<const Block>(info.source_header)));

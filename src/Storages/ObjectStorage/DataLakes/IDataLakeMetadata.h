@@ -69,6 +69,11 @@ public:
     /// Table schema from data lake metadata.
     virtual NamesAndTypesList getTableSchema(ContextPtr local_context) const = 0;
 
+    /// Exact row count answerable from catalog metadata alone (no file reads), for the
+    /// unfiltered count(*) fast path. Nullopt = not supported; the caller falls back to
+    /// the generic file-metadata count path.
+    virtual std::optional<UInt64> getTotalCountFromMetadata() const { return std::nullopt; }
+
     /// Returns the current table state snapshot (snapshot version, schema id, etc.)
     /// Used to pin the exact state for both analysis and execution phases of a query,
     /// preventing logical races when the datalake is updated mid-query.
@@ -157,6 +162,21 @@ public:
     virtual void checkMutationIsPossible(const MutationCommands & /*commands*/) { throwNotImplemented("mutations"); }
 
     virtual void addDeleteTransformers(ObjectInfoPtr, QueryPipelineBuilder &, const std::optional<FormatSettings> &, FormatParserSharedResourcesPtr, ContextPtr) const { }
+
+    /// Some data lakes can produce rows that are not backed by files (e.g. DuckLake inlined
+    /// data rows stored in the catalog database). The returned pipe is united with the
+    /// file-reading pipes of the read step, so it must produce exactly
+    /// `info.source_header` (including row-level filter / prewhere handling, mirroring the
+    /// fallback filter path of StorageObjectStorageSource).
+    virtual Pipe getAdditionalReadPipe(
+        const ReadFromFormatInfo & /*info*/,
+        StorageMetadataPtr /*storage_metadata_snapshot*/,
+        ContextPtr /*context*/,
+        size_t /*max_block_size*/) const
+    {
+        return {};
+    }
+
     virtual void checkAlterIsPossible(const AlterCommands & /*commands*/) { throwNotImplemented("alter"); }
     virtual void alter(
         const AlterCommands & /*params*/,

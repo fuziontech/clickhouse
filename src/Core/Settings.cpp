@@ -7699,6 +7699,11 @@ Query Iceberg table using the snapshot that was current at a specific timestamp.
     DECLARE(Int64, iceberg_snapshot_id, 0, R"(
 Query Iceberg table using the specific snapshot id.
 )", 0) \
+    DECLARE(Int64, ducklake_snapshot_id, 0, R"(
+Query DuckLake table(s) using the specific catalog snapshot id (0 = latest). The initiator
+node of a parallel-replicas query sets this automatically to the snapshot it pinned, so every
+replica reads the same catalog snapshot; it can also be set explicitly for time travel.
+)", 0) \
     DECLARE(Bool, allow_experimental_geo_types_in_iceberg, false, R"(
 Allow parsing Iceberg `geometry` and `geography` field types as ClickHouse `Geometry` (Variant) type.
 )", 0) \
@@ -8721,6 +8726,9 @@ Multiple algorithms can be specified as a comma-separated list, e.g. `dphyp,gree
 )", EXPERIMENTAL) \
     DECLARE(Bool, allow_experimental_database_paimon_rest_catalog, false, R"(
 Allow experimental database engine DataLakeCatalog with catalog_type = 'paimon_rest'
+)", EXPERIMENTAL) \
+    DECLARE(Bool, allow_experimental_database_ducklake_catalog, false, R"(
+Allow experimental database engine DataLakeCatalog with catalog_type = 'ducklake'
 )", EXPERIMENTAL) \
     DECLARE(UInt64, webassembly_udf_max_fuel, 100'000, R"(
 Fuel limit per WebAssembly UDF instance execution. Each WebAssembly instruction consumes some amount of fuel. The value is scaled by 1024 before being passed to the runtime, so `webassembly_udf_max_fuel = 1` corresponds to approximately 1024 fuel units. Set to 0 for no finite limit. Applies only to functions whose per-function setting `webassembly_udf_enable_fuel` is true, which is the default.
